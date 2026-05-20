@@ -1,0 +1,14 @@
+# Direct dependencies for doolyprof.
+# Versions left unpinned so pip can resolve against your CUDA / Python stack.
+# Tested with PyTorch 2.9.1+, vLLM 0.17.x, transformers 4.57+.
+
+torch>=2.9.1
+vllm>=0.17.0
+transformers>=4.55.0
+numpy
+tqdm
+einops
+
+# Optional: required only if using --attention-backend FLASHINFER (default).
+# Comment out if profiling with FLASH_ATTN or XFORMERS instead.
+flashinfer-python

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Profiler outputs
+vllm_traces_tp/
+*.trace.json
+*.pt.trace.json
+hierarchy_output.json
+
+# Databases / large artifacts
+*.db
+*.db-journal
+*.csv
+*.png
+*.pdf
+*.pkl
+
+# Local working dirs
+local/
+tests/
+
+# CLAUDE / agent files
+.claude/
+CLAUDE.md
