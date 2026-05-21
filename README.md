@@ -74,6 +74,7 @@ doolyprof/
     ├── tracer/      # Taint propagation through PyTorch ops
     ├── profiler/    # Layer profiling and operation capture
     └── run/         # Entry points: run-tracer, run-profiler, run-e2e
+└── example_traces/  # Example tainted traces (output of run-tracer)
 ```
 
 ## Citation
