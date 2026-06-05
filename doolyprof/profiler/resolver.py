@@ -797,7 +797,7 @@ class ModuleResolver:
         return absorbed_names, absorbed_from_resolved
 
 # ---------------------------------------------------------------------------
-# Manual test: python -m dooly.profiler.resolver <trace.json> <model>
+# Manual test: python -m doolyprof.profiler.resolver <trace.json> <model>
 # Loads the real vLLM model, then shows which callable each module resolves to.
 # ---------------------------------------------------------------------------
 

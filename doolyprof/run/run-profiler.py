@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from time import time
 
-# Add project root to path for dooly imports
-# run-profiler.py -> run/ -> dooly/ -> dooly (repo root)
+# Add project root to path for doolyprof imports
+# run-profiler.py -> run/ -> doolyprof/ -> repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Parse --tp and --gpu early BEFORE importing vLLM / torch / CUDA.

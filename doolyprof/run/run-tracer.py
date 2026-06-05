@@ -21,8 +21,8 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-# Add project root to path for dooly imports
-# run-tracer.py -> run/ -> dooly/ -> dooly (repo root)
+# Add project root to path for doolyprof imports
+# run-tracer.py -> run/ -> doolyprof/ -> repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Parse arguments BEFORE any heavy imports
