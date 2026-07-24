@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 from torch.profiler import record_function
 
-from .types import Taint, DimTaint, TaintedInt, TaintedFloat, TaintedShape
+from .types import Taint, DimTaint, TaintedInt, TaintedFloat, TaintedShape, unwrap_taint
 from .tensor import TaintedTensor
 
 __all__ = [
@@ -706,7 +706,7 @@ def _wrap_torch_reshape(original_fn):
                     dim_val = tensor.shape[i]
                     if isinstance(dim_val, TaintedInt):
                         # Extract plain Taint from DimTaint if needed (for dictionary key)
-                        plain_taint = dim_val.taint.taint if isinstance(dim_val.taint, DimTaint) else dim_val.taint
+                        plain_taint = unwrap_taint(dim_val.taint)
                         taint_dict[plain_taint] = dim_val.value * taint_dict.get(plain_taint, 1)
                     elif taint is not None:
                         # Create TaintedInt from size and taint
@@ -869,12 +869,8 @@ def _wrap_view_reshape(original_fn, fn_name):
                     else:
                         # Simple dimension: use actual size as quantity
                         if dim_taint.taint is not None:
-                            if isinstance(dim_taint.taint, DimTaint):
-                                # Extract plain Taint from DimTaint if needed (for dictionary key)
-                                plain_taint = dim_taint.taint.taint if isinstance(dim_taint.taint, DimTaint) else dim_taint.taint
-                                aggregated[plain_taint] = aggregated.get(plain_taint, 1) * dim_size
-                            else:
-                                aggregated[dim_taint.taint] = aggregated.get(dim_taint.taint, 1) * dim_size
+                            plain_taint = unwrap_taint(dim_taint.taint)
+                            aggregated[plain_taint] = aggregated.get(plain_taint, 1) * dim_size
                             
                 # print(f"[DEBUG @ _wrap_view_reshape] Step 1 - aggregated input taints: {aggregated}")
 
@@ -889,7 +885,7 @@ def _wrap_view_reshape(original_fn, fn_name):
                     # Extract taint directly from TaintedInt/TaintedFloat
                     if isinstance(arg, (TaintedInt, TaintedFloat)) and arg.taint:
                         # Extract plain Taint from DimTaint if needed (for dictionary key)
-                        taint = arg.taint.taint if isinstance(arg.taint, DimTaint) else arg.taint
+                        taint = unwrap_taint(arg.taint)
                         value = int(arg)
                         consumed[taint] = consumed.get(taint, 1) * value
                         
@@ -1008,15 +1004,16 @@ def _wrap_view_reshape(original_fn, fn_name):
 
                         if isinstance(arg.taint, DimTaint):
                             # Already a DimTaint - preserve it as-is (including merge_history)
+                            inner_taint = unwrap_taint(arg.taint)
                             if arg.taint.merge_history:
                                 # Has existing history - use it
-                                output_taints.append(DimTaint(arg.taint.taint, merge_history=arg.taint.merge_history))
+                                output_taints.append(DimTaint(inner_taint, merge_history=arg.taint.merge_history))
                             else:
-                                output_taints.append(DimTaint(arg.taint.taint, merge_history={arg.taint.taint: arg_value}))
+                                output_taints.append(DimTaint(inner_taint, merge_history={inner_taint: arg_value}))
                         else:
                             # Plain Taint - create new history
                             # Safety: ensure arg.taint is a base Taint, not DimTaint
-                            base_taint = arg.taint.taint if isinstance(arg.taint, DimTaint) else arg.taint
+                            base_taint = unwrap_taint(arg.taint)
                             output_taints.append(DimTaint(base_taint, merge_history={base_taint: arg_value}))
                     else:
                         # Plain int (untainted)

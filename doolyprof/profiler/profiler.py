@@ -1116,7 +1116,6 @@ class Profiler:
                             with set_forward_context(
                                 forward_context,
                                 self.module_caller.vllm_config,
-                                virtual_engine=0,
                                 num_tokens=num_tokens_for_context,
                                 slot_mapping=slot_mapping_dict
                             ):
@@ -1126,7 +1125,6 @@ class Profiler:
                             with set_forward_context(
                                 forward_context,
                                 self.module_caller.vllm_config,
-                                virtual_engine=0,
                                 num_tokens=num_tokens_for_context,
                                 slot_mapping=slot_mapping_dict
                             ):

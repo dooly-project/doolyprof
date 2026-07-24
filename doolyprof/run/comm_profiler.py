@@ -446,7 +446,7 @@ class CommProfiler:
             dtype=dtype,  # Model dtype for initialization
             enforce_eager=True,
             load_format="dummy",  # Fast initialization without loading real weights
-            gpu_memory_utilization=0.5,  # Conservative for profiling
+            gpu_memory_utilization=0.85,  # Must cover the real per-rank weight shard (e.g. ~120GB/GPU for 480B FP8 at TP=4); max_model_len is small so KV cache stays tiny
             max_model_len=2048,  # Small model_len sufficient for comm profiling
             tensor_parallel_size=tp_size,  # REAL tensor parallelism
         )

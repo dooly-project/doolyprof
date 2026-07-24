@@ -376,10 +376,20 @@ class VLLMLayerProfiler:
             np.arange(start_pos, start_pos + tokens_per_seq, dtype=np.int32),
             batch_size,
         )
-        bt.compute_slot_mapping(req_indices, positions)
-
-        bt.commit_block_table(batch_size)
-        bt.commit_slot_mapping(num_tokens)
+        if hasattr(bt, "commit_slot_mapping"):
+            # vLLM <= 0.17: CPU-side slot mapping, committed to GPU afterwards
+            bt.compute_slot_mapping(req_indices, positions)
+            bt.commit_block_table(batch_size)
+            bt.commit_slot_mapping(num_tokens)
+        else:
+            # vLLM >= 0.21: compute_slot_mapping(num_reqs, query_start_loc, positions)
+            # is a Triton kernel reading block_table.gpu and writing
+            # slot_mapping.gpu directly, so the block table must be on GPU first.
+            bt.commit_block_table(batch_size)
+            positions_gpu = torch.from_numpy(positions).to(
+                device=self.device, dtype=torch.int64
+            )
+            bt.compute_slot_mapping(batch_size, query_start_loc, positions_gpu)
 
         # retrieve first batch_size rows (existing + new)
         # each containing block IDs spanning entire KV Sequence

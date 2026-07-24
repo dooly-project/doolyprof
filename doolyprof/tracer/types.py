@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 import torch
 
-__all__ = ['Taint', 'DimTaint', 'TaintedInt', 'TaintedFloat', 'TaintedList', 'TaintedShape']
+__all__ = ['Taint', 'DimTaint', 'TaintedInt', 'TaintedFloat', 'TaintedList', 'TaintedShape', 'unwrap_taint']
 
 
 @dataclass(frozen=True)
@@ -10,6 +10,18 @@ class Taint:
     name: str
     def __repr__(self):
         return self.name
+
+
+def unwrap_taint(taint):
+    """Fully unwrap (possibly nested) DimTaint wrappers to the underlying Taint.
+
+    Some propagation paths (e.g. FP8 block-scaled linear in MoE models) produce
+    DimTaint(taint=DimTaint(...)) nesting; a single-level unwrap then leaks an
+    unhashable DimTaint into dict keys. Unwrap until a plain Taint (or None).
+    """
+    while isinstance(taint, DimTaint):
+        taint = taint.taint
+    return taint
 
 
 @dataclass
