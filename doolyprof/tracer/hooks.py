@@ -326,7 +326,15 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
     #                  was called in one process but not the other
     #   quant_config, query_quant : late-bound infrastructure objects that
     #                  may be None in one context and non-None in another
-    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant"})
+    #   moe_layer_id, layer_id, layer_idx, layer_index : per-instance
+    #                  identity counters (e.g. vLLM FusedMoE.moe_layer_id).
+    #                  They differ across otherwise-identical layers, which
+    #                  fragments one profile target into num_layers copies
+    #                  (62x redundant profiling on Qwen3-480B's FusedMoE).
+    _NON_CONFIG_ATTRS = frozenset({
+        "training", "quant_config", "query_quant",
+        "moe_layer_id", "layer_id", "layer_idx", "layer_index",
+    })
 
     try:
         d = vars(module)
