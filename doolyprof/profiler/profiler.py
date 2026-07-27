@@ -192,6 +192,8 @@ class Profiler:
         world_config: Optional[Dict[str, int]] = None,
         db_path: Optional[str] = None,
         gpu: str = "0",
+        kv_cache_dtype: str = "auto",
+        block_size: Optional[int] = None,
     ):
         self.importer = OpImporter()
         self.module_caller = None
@@ -201,6 +203,8 @@ class Profiler:
         self.tp_config = world_config.get("tp", 1)
         self.pp_config = world_config.get("pp", 1)
         self.gpu = gpu
+        self.kv_cache_dtype = kv_cache_dtype
+        self.block_size = block_size
 
         # Initialize database if db_path provided
         if self.db_path:
@@ -758,6 +762,8 @@ class Profiler:
             flash_attn_version=self.flash_attn_version,
             quantization=self.quantization,
             gpu=self.gpu,
+            kv_cache_dtype=self.kv_cache_dtype,
+            block_size=self.block_size,
         )
 
         # Re-resolve callables with loaded model. Pass the taint_registry

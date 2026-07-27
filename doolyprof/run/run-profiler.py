@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-backend", default="FLASHINFER")
     parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4],
                         help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
+    parser.add_argument("--kv-cache-dtype", type=str, default="auto",
+                        help="KV cache dtype passed to vLLM (e.g. 'fp8'). Match your serving config so attention kernels are profiled with the same KV precision.")
+    parser.add_argument("--block-size", type=int, default=None,
+                        help="KV cache block size passed to vLLM. Match your serving config (e.g. 256); default keeps vLLM's default.")
     parser.add_argument("--quantization", type=str, default=None,
                         choices=["fp8", "awq", "gptq"],
                         help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). "
@@ -96,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu):
+def resolve_model(model, dtype, attention_backend, flash_attn_version, quantization, max_seq_len, result_queue, gpu, kv_cache_dtype="auto", block_size=None):
     from doolyprof.profiler.importer import OpImporter
     from doolyprof.profiler.resolver import ModuleResolver
     from doolyprof.profiler.vllm_layer_profiler import VLLMLayerProfiler
@@ -122,6 +126,8 @@ def resolve_model(model, dtype, attention_backend, flash_attn_version, quantizat
         flash_attn_version=flash_attn_version,
         quantization=quantization,
         gpu=gpu,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=block_size,
     )
     resolver = ModuleResolver(
         vlp=vlp,
@@ -224,7 +230,7 @@ def main() -> None:
 
     for i, model in enumerate(models):
         print(f"[RUNNER] Starting RESOLVER for {model.name}...")
-        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu))
+        p = mp.Process(target=resolve_model, args=(model, dtype, args.attention_backend, args.flash_attn_version, args.quantization, args.max_seq_len, result_queue, args.gpu, args.kv_cache_dtype, args.block_size))
         p.start()
         model.to_profile_resolved = result_queue.get()
         p.join()
@@ -260,6 +266,8 @@ def main() -> None:
         dtype=dtype,
         db_path=args.db_path,
         gpu=args.gpu,
+        kv_cache_dtype=args.kv_cache_dtype,
+        block_size=args.block_size,
     )
     
     import time

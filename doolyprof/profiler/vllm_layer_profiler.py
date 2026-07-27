@@ -71,7 +71,9 @@ class VLLMLayerProfiler:
         attn_backend: str = "FLASHINFER",
         flash_attn_version: int = 2,
         quantization: Optional[str] = None,
-        gpu: str = "0"
+        gpu: str = "0",
+        kv_cache_dtype: str = "auto",
+        block_size: Optional[int] = None,
     ):
         """
         Initialize the profiler by creating a vLLM LLM instance.
@@ -85,6 +87,12 @@ class VLLMLayerProfiler:
             quantization: Optional quantization scheme (e.g. "fp8", "awq", "gptq").
                 When set with load_format="dummy", vLLM initializes random
                 quantized weights — no need to download a quantized checkpoint.
+            kv_cache_dtype: KV cache dtype passed to vLLM ("auto", "fp8", ...).
+                The engine's real KV cache tensors are used for attention
+                profiling, so this directly controls the profiled kernels.
+            block_size: KV cache block size passed to vLLM. None keeps vLLM's
+                default. Attention metadata (block tables, slot mappings) is
+                derived from the engine's kv_cache_spec, so this flows through.
         """
         self.model_name = model_name
         self.dtype = dtype
@@ -117,6 +125,10 @@ class VLLMLayerProfiler:
             llm_kwargs["attention_config"] = {"flash_attn_version": flash_attn_version}
         if quantization:
             llm_kwargs["quantization"] = quantization
+        if kv_cache_dtype != "auto":
+            llm_kwargs["kv_cache_dtype"] = kv_cache_dtype
+        if block_size is not None:
+            llm_kwargs["block_size"] = block_size
         self.llm = LLM(**llm_kwargs)
 
         # Extract internals

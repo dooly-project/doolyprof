@@ -39,6 +39,8 @@ parser.add_argument("--attention-backend", type=str, default="FLASH_ATTN", help=
 parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
 parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). With load_format=dummy, vLLM initializes random quantized weights — no quantized checkpoint needed.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
+parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="KV cache dtype passed to vLLM (e.g. 'fp8'). Match your serving config so the trace captures the same attention kernels.")
+parser.add_argument("--block-size", type=int, default=None, help="KV cache block size passed to vLLM. Match your serving config (e.g. 256).")
 args = parser.parse_args()
 
 import torch
@@ -224,6 +226,10 @@ if __name__ == "__main__":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
         if args.quantization:
             llm_kwargs["quantization"] = args.quantization
+        if args.kv_cache_dtype != "auto":
+            llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+        if args.block_size is not None:
+            llm_kwargs["block_size"] = args.block_size
         llm = LLM(**llm_kwargs)
 
         # Check weight shapes to verify sharding
