@@ -64,14 +64,20 @@ from doolyprof.tracer import disable_taint_tracking, enable_taint_tracking
 disable_taint_tracking()
 print("[Tracer] Taint tracking DISABLED during initialization/warm-up")
 
-patch_autoconfig()
-# patch_common_attention_metadata()
-patch_input_buffers()
+# install_hooks() MUST run before patch_autoconfig()/patch_input_buffers():
+# it patches torch.compile with the taint-aware wrapper, and patch_input_buffers()
+# transitively imports vllm.model_executor.layers.vocab_parallel_embedding (whose
+# get_masked_input_and_mask is @torch.compile-decorated at import time). Patching
+# torch.compile first ensures that decorator captures the taint-aware wrapper so it
+# bypasses Dynamo for TaintedTensor inputs (avoids the tp>1 PatchedSize crash).
 install_hooks(
     int_patch_modules=[
         "vllm.model_executor.layers.rotary_embedding",
     ]
 )
+patch_autoconfig()
+# patch_common_attention_metadata()
+patch_input_buffers()
 
 # Patch torch.nn.Parameter.__new__ so that when constructed from a
 # TaintedTensor, the data is unwrapped to a plain torch.Tensor before
@@ -84,13 +90,21 @@ _original_parameter_new = torch.nn.Parameter.__new__
 
 def _patched_parameter_new(cls, data=None, requires_grad=True):
     from doolyprof.tracer.tensor import TaintedTensor
+    dim_taints = None
     if isinstance(data, TaintedTensor):
+        # Save the dim taints before unwrapping so the weight Parameter keeps
+        # its MODEL_CONFIG dims (re-attached below). The unwrap itself preserves
+        # the vLLM Parameter subclass identity (BasevLLMParameter/weight_loader).
+        dim_taints = tuple(data._dim_taints)
         # Unwrap: get the plain Tensor view of the same storage, so that
         # type(data) is torch.Tensor and Parameter.__new__ takes the
         # _make_subclass(cls, ...) path that actually returns `cls`.
         with torch._C._DisableTorchDispatch():
             data = torch.Tensor._make_subclass(torch.Tensor, data, False)
-    return _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+    param = _original_parameter_new(cls, data=data, requires_grad=requires_grad)
+    if dim_taints is not None:
+        object.__setattr__(param, "_dim_taints", dim_taints)
+    return param
 
 torch.nn.Parameter.__new__ = _patched_parameter_new
 

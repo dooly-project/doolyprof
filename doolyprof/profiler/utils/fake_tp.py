@@ -208,22 +208,36 @@ def apply_fake_tp_patches(tp_size: int) -> None:
     try:
         from vllm.config.model import ModelConfig
         # Store original method
-        original_get_num_attention_heads = ModelConfig.get_num_attention_heads
+        original_get_num_kv_heads = ModelConfig.get_num_kv_heads
 
-        def fake_get_num_attention_heads(self, parallel_config):
-            """Patched version that uses fake TP size instead of real parallel_config."""
-            num_heads = self.model_arch_config.total_num_attention_heads
-            result = num_heads // tp_size  # Use fake TP size instead of parallel_config.tensor_parallel_size
-            print(f"[FakeTP] get_num_attention_heads: {num_heads} // {tp_size} = {result} (vs original: {num_heads // parallel_config.tensor_parallel_size})")
+        def fake_get_num_kv_heads(self, parallel_config):
+            """Patched version that uses fake TP size instead of real parallel_config.
+
+            Mirrors vLLM's own semantics: MLA collapses to one KV head during decode,
+            and KV heads are replicated rather than split when the total is smaller
+            than the TP degree, so every rank keeps at least one.
+
+            Needed because some backends read the KV head count from ModelConfig
+            rather than from the attention layer. TritonAttentionMetadataBuilder
+            computes seq_threshold_3D = MIN_LAUNCH_GRID_SIZE_2D // num_heads_kv, so an
+            unsharded count makes that threshold too small and selects the 2D kernel
+            at batch sizes where a real TP rank would select the 3D kernel.
+            """
+            if self.use_mla:
+                # When using MLA during decode it becomes MQA
+                return 1
+            total_num_kv_heads = self.get_total_num_kv_heads()
+            result = max(1, total_num_kv_heads // tp_size)  # fake TP size, not parallel_config
+            print(f"[FakeTP] get_num_kv_heads: {total_num_kv_heads} // {tp_size} = {result} (vs original: {max(1, total_num_kv_heads // parallel_config.tensor_parallel_size)})")
             return result
 
         # Apply the patch
-        ModelConfig.get_num_attention_heads = fake_get_num_attention_heads
+        ModelConfig.get_num_kv_heads = fake_get_num_kv_heads
 
-        print(f"[FakeTP] Patched ModelConfig.get_num_attention_heads to use TP={tp_size}")
+        print(f"[FakeTP] Patched ModelConfig.get_num_kv_heads to use TP={tp_size}")
 
     except ImportError:
-        print(f"[FakeTP] Warning: Could not patch ModelConfig.get_num_attention_heads")
+        print(f"[FakeTP] Warning: Could not patch ModelConfig.get_num_kv_heads")
 
 
     # MIGHT NOT NEED THIS ANYMORE:
