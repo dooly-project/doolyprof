@@ -181,25 +181,32 @@ class ModuleComparator:
     def _collect_descendant_signatures(self, event: Event, depth: int = 0) -> List[Tuple[str, int, Tuple]]:
         """Recursively collect signatures from all descendants.
 
-        Returns list of (name, depth, params_tuple) for each descendant.
-        This captures the full operation tree structure.
+        Returns list of (name, depth, params_tuple) for each SEMANTIC
+        descendant (torch-op / nn.Module / cpu_op / comm nodes, with their
+        tainted input dims). Raw device-kernel nodes are excluded structurally
+        by ``child.cat == 'kernel'`` (the Kineto category set in parser.py),
+        not by a name heuristic, because their autotuner-chosen
+        tile/prefix/format specialization varies with the traced token count
+        and falsely splits identical ops.
         """
         signatures = []
 
         for idx, child in event.children.items():
             child_name = child.name
 
-            # Extract params: prefer module_info if available, else parse event directly
-            if child.module_info:
-                params_list = child.module_info._semantic_params_list()
-                params = params_list[0] if params_list else {}
-            else:
-                params = self._extract_params_from_event(child)
+            if child.cat != 'kernel':
+                # Extract params: prefer module_info if available, else parse event directly
+                if child.module_info:
+                    params_list = child.module_info._semantic_params_list()
+                    params = params_list[0] if params_list else {}
+                else:
+                    params = self._extract_params_from_event(child)
 
-            params_tuple = tuple(sorted(params.items()))
-            signatures.append((child_name, depth, params_tuple))
+                params_tuple = tuple(sorted(params.items()))
+                signatures.append((child_name, depth, params_tuple))
 
-            # Recurse into grandchildren
+            # Recurse into grandchildren (descend even through a dropped raw
+            # kernel node so any semantic descendants are preserved).
             child_signatures = self._collect_descendant_signatures(child, depth + 1)
             signatures.extend(child_signatures)
 
@@ -252,30 +259,41 @@ class ModuleComparator:
     def _module_signature(
         self, module: ModuleInfo
     ) -> Tuple:
-        # Module-level anchors (post-walk-up Attention, etc.) need the
-        # containing-module kernel set so SWA / fused-variant splits propagate
-        # to distinct DB rows. Standalone cpu_op anchors do NOT need it —
-        # their own kernel + input shapes fully determine their latency, and
-        # including module_kernel_tuple would split identical-latency profile
-        # targets on irrelevant sibling-context differences (e.g. an
-        # RMSNorm's fused-residual-add kernel has no effect on an inner
-        # aten::mul's own latency).
-        parts = [
+        # Signature = operation_name
+        #           + semantic descendant structure (torch-op / module-class
+        #             names with tainted dims; raw device-kernel symbols are
+        #             filtered out in _collect_descendant_signatures)
+        #           + state_hash (own for modules, else nearest parent
+        #             module's — carries runtime-branching config such as
+        #             sliding_window that shapes alone don't capture)
+        #           + dtype (the only discriminator none of the above encode).
+        #
+        # The raw autotuner kernel symbols that used to form two extra tuple
+        # parts (_get_kernel_signature / _get_module_kernel_signature) are
+        # DROPPED: their tile/prefix/format specialization changes with the
+        # traced token count and was falsely splitting identical ops. Backend
+        # / algorithm identity is preserved by the semantic op NAMES that
+        # remain in the descendant structure (e.g. _vllm_fa2_C::varlen_fwd for
+        # FLASH_ATTN vs its absence).
+        if module.is_module:
+            state_hash = module.state_hash or ""
+        else:
+            # cpu_op (non-module) anchor: inherit the nearest containing
+            # module's state hash (the tracer stashed it on the module event's
+            # args via _extract_module_state_hash). Two identical ops living
+            # under differently-configured parents therefore stay distinct.
+            nearest = module.hierarchy.nearest_module if module.hierarchy else None
+            state_hash = ""
+            if nearest is not None:
+                state_hash = (getattr(nearest, "args", {}) or {}).get("state_hash", "") or ""
+
+        parts = (
             module.operation_name,
             self._get_model_param_signature(module),
-            self._get_kernel_signature(module),
-        ]
-        if module.is_module:
-            parts.append(self._get_module_kernel_signature(module))
-            # Module-instance state hash. Distinguishes two instances of the
-            # same class that share kernel symbols but differ in
-            # runtime-branching config (e.g. Attention layers with
-            # sliding_window=None vs 4096 under FA2/Triton — the kernel
-            # symbol alone can't see the difference, but the module's
-            # primitive attrs can). Empty string for older traces or modules
-            # with no capturable state — preserves legacy hash behavior.
-            parts.append(module.state_hash or "")
-        return tuple(parts)
+            state_hash,
+            module.dtype or "",
+        )
+        return parts
 
     def _hash_signature(self, signature: Tuple) -> str:
         """Convert a signature tuple to a stable hash string."""
