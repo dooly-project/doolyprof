@@ -472,8 +472,16 @@ def patch_input_buffers():
 
         _original_scheduler_output_getattribute = SchedulerOutput.__getattribute__
 
+        from . import is_taint_tracking_enabled as _is_taint_enabled
+
         def patched_scheduler_output_getattribute(self, name):
             value = _original_scheduler_output_getattribute(self, name)
+            # Honor the global taint-tracking flag: stay inert during init /
+            # warm-up / vLLM's memory-profiling dummy run (matches the dispatcher
+            # hooks). vLLM 0.25.1's init dummy run schedules a full batch, so
+            # NUM_REQS would collide with MAX_NUM_REQS if registered here.
+            if not _is_taint_enabled():
+                return value
             if name == 'num_scheduled_tokens':
                 if isinstance(value, dict) and not isinstance(value, TaintedLenDict):
                     register_taint(len(value), Taint('NUM_REQS'))
@@ -488,6 +496,32 @@ def patch_input_buffers():
         # print("[DEBUG @ patch_input_buffers] SchedulerOutput patch applied", flush=True)
     except ImportError as e:
         print(f"[DEBUG @ patch_input_buffers] SchedulerOutput ImportError - {e}", flush=True)
+
+    # Patch InputBatch.num_reqs to return a TaintedInt(NUM_REQS) for the ACTUAL
+    # runtime batch size. num_reqs = len(req_id_to_index) is otherwise a plain
+    # int, so derived quantities (e.g. num_reqs+1 for cu_seqlens/query_start_loc)
+    # lose the request-dimension taint. Returning a TaintedInt lets the taint
+    # PROPAGATE through arithmetic and slicing (TaintedTensor.__getitem__ tags a
+    # sliced dim from a TaintedInt slice bound) rather than pre-registering the
+    # value. Gated by the taint-tracking flag so warm-up / dummy runs stay inert.
+    global _original_input_batch_num_reqs
+    try:
+        from vllm.v1.worker.gpu_input_batch import InputBatch
+        from . import is_taint_tracking_enabled as _is_taint_enabled_nr
+        if _original_input_batch_num_reqs is None and isinstance(
+            getattr(InputBatch, "num_reqs", None), property
+        ):
+            _original_input_batch_num_reqs = InputBatch.num_reqs.fget
+
+            def _tainted_num_reqs(self):
+                n = _original_input_batch_num_reqs(self)
+                if _is_taint_enabled_nr() and isinstance(n, int) and not isinstance(n, TaintedInt):
+                    return TaintedInt(n, 'NUM_REQS')
+                return n
+
+            InputBatch.num_reqs = property(_tainted_num_reqs)
+    except ImportError as e:
+        print(f"[DEBUG @ patch_input_buffers] InputBatch ImportError - {e}", flush=True)
 
     # Patch model_runner's len() to prevent it from stripping int subclasses
     try:

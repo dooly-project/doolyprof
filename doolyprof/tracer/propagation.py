@@ -12,6 +12,19 @@ def _to_dim_taint(t) -> Optional[DimTaint]:
         return t
     return DimTaint.from_taint(t)
 
+
+def _base_taint(t):
+    """Fully unwrap nested DimTaint(s) down to the base Taint (or None).
+
+    A single-level unwrap (t.taint) leaves DimTaint(DimTaint(X)) as DimTaint(X),
+    which then compares unequal to a plain DimTaint(X) and raises a spurious
+    "multiple different taints" error. register_taint already unwraps fully;
+    mirror that here so equal taints compare equal regardless of nesting depth.
+    """
+    while isinstance(t, DimTaint):
+        t = t.taint
+    return t
+
 def propagate_taints(
     input_infos: List[Tuple[Tuple[int, ...], Tuple[Optional[Taint], ...]]],
     output_shape: Tuple[int, ...]
@@ -40,7 +53,7 @@ def propagate_taints(
             taint = taints[i] if i < len(taints) else None
             if taint is not None:
                 # Skip None taints (untainted dimensions)
-                taint_val = taint.taint if isinstance(taint, DimTaint) else taint
+                taint_val = _base_taint(taint)
                 if taint_val is None:
                     continue
 
@@ -49,8 +62,8 @@ def propagate_taints(
                 else:
                     # Check if taints are semantically the same (compare values, not object identity)
                     existing = input_dim_taints[size]
-                    existing_val = existing.taint if isinstance(existing, DimTaint) else existing
-                    new_val = taint.taint if isinstance(taint, DimTaint) else taint
+                    existing_val = _base_taint(existing)
+                    new_val = _base_taint(taint)
 
                     # If either is None, keep the non-None one
                     if existing_val is None and new_val is not None:

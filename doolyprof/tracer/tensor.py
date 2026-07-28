@@ -16,6 +16,58 @@ def _get_plain_taint(t) -> Taint:
         return t.taint
     return t
 
+
+def _dim_taint_from_registry(size):
+    from .registry import lookup_taint
+
+    registry_info = lookup_taint(int(size))
+    if registry_info is None:
+        return None
+    if isinstance(registry_info, dict):
+        return DimTaint(
+            registry_info["taint"],
+            merge_history=registry_info["components"],
+        )
+    if isinstance(registry_info, DimTaint):
+        return registry_info
+    return DimTaint.from_taint(registry_info)
+
+
+def _format_dim(size, dim_taint, include_history=False):
+    if dim_taint is None or (
+        isinstance(dim_taint, DimTaint) and dim_taint.taint is None
+    ):
+        dim_taint = _dim_taint_from_registry(size) or dim_taint
+    if isinstance(dim_taint, DimTaint):
+        actual_taint = dim_taint
+        while isinstance(actual_taint.taint, DimTaint):
+            if actual_taint.taint.has_history and not actual_taint.has_history:
+                actual_taint = actual_taint.taint
+            else:
+                actual_taint = DimTaint(
+                    actual_taint.taint.taint,
+                    merge_history=actual_taint.taint.merge_history
+                    or actual_taint.merge_history,
+                )
+        if actual_taint.taint is None:
+            registry_taint = _dim_taint_from_registry(size)
+            if registry_taint is not None:
+                return _format_dim(size, registry_taint, include_history)
+            if int(size) == 1:
+                return "SINGLETON(1)"
+        if include_history and actual_taint.has_history:
+            history_str = ",".join(
+                f"{taint}:{qty}" for taint, qty in actual_taint.merge_history.items()
+            )
+            return f"{actual_taint.display(size)}[hist:{history_str}]"
+        return actual_taint.display(size)
+    if dim_taint is not None:
+        return f"{dim_taint}({size})"
+    if int(size) == 1:
+        return "SINGLETON(1)"
+    return f"?({size})"
+
+
 def _get_target_device(args, kwargs):
     """Find target device - prefer CUDA if any tensor is on CUDA."""
     target_device = None
@@ -506,13 +558,9 @@ class TaintedTensor(torch.Tensor):
         for i, size in enumerate(sizes):
             t = self._dim_taints[i] if i < len(self._dim_taints) else None
             if t is None:
-                parts.append(f"?({size})")
+                parts.append(_format_dim(size, None))
             elif isinstance(t, DimTaint):
-                # Handle nested DimTaints - unwrap to get the actual taint
-                actual_taint = t
-                while isinstance(actual_taint.taint, DimTaint):
-                    actual_taint = actual_taint.taint
-                parts.append(actual_taint.display(size))
+                parts.append(_format_dim(size, t))
             else:
                 # Plain Taint
                 parts.append(f"{t}({size})")
@@ -525,25 +573,9 @@ class TaintedTensor(torch.Tensor):
         for i, size in enumerate(sizes):
             t = self._dim_taints[i] if i < len(self._dim_taints) else None
             if t is None:
-                parts.append(f"?({size})")
+                parts.append(_format_dim(size, None, include_history=True))
             elif isinstance(t, DimTaint):
-                # Handle nested DimTaints - unwrap until we get to the actual taint
-                actual_taint = t
-                while isinstance(actual_taint.taint, DimTaint):
-                    # Merge the history if the inner DimTaint has it
-                    if actual_taint.taint.has_history and not actual_taint.has_history:
-                        actual_taint = actual_taint.taint
-                    else:
-                        actual_taint = DimTaint(actual_taint.taint.taint,
-                                              merge_history=actual_taint.taint.merge_history or actual_taint.merge_history)
-
-                # Now format the output using the unwrapped taint
-                if actual_taint.has_history:
-                    # Format as "taint:qty,taint:qty,..." (e.g., "NUM_TOKS:269,MODEL_CONFIG:40")
-                    history_str = ",".join(f"{taint}:{qty}" for taint, qty in actual_taint.merge_history.items())
-                    parts.append(f"{actual_taint.display(size)}[hist:{history_str}]")
-                else:
-                    parts.append(actual_taint.display(size))
+                parts.append(_format_dim(size, t, include_history=True))
             else:
                 # Debug: This shouldn't happen if normalize_taint worked correctly
                 import os
@@ -586,12 +618,16 @@ class TaintedTensor(torch.Tensor):
                 shape = tuple(sizes)
                 input_infos.append((shape, obj._dim_taints))
             elif isinstance(obj, torch.Tensor):
-                # Include plain tensors with None taints so multi-input ops
-                # (embedding, gather, index_select) are not mistaken for
-                # single-input ops by the view/slice heuristics.
+                # Include plain tensors so multi-input ops (embedding, gather,
+                # index_select) are not mistaken for single-input ops by the
+                # view/slice heuristics. Read any _dim_taints re-attached to a
+                # weight Parameter so its taints propagate to op outputs.
                 sizes = torch.Tensor.size(obj)
                 shape = tuple(sizes)
-                input_infos.append((shape, tuple(None for _ in range(len(shape)))))
+                explicit_taints = getattr(obj, "_dim_taints", None)
+                if explicit_taints is None:
+                    explicit_taints = tuple(None for _ in range(len(shape)))
+                input_infos.append((shape, tuple(explicit_taints)))
             if isinstance(obj, (list, tuple)) and not isinstance(obj, TaintedShape):
                 for item in obj:
                     collect_from(item)
@@ -742,7 +778,10 @@ class TaintedTensor(torch.Tensor):
                 if isinstance(tensor, TaintedTensor):
                     return tensor.taint_str_with_history()
                 elif isinstance(tensor, torch.Tensor):
-                    dims = [f"?({d})" for d in tensor.shape]
+                    _dt = getattr(tensor, "_dim_taints", None)
+                    sizes = torch.Tensor.size(tensor)
+                    dims = [_format_dim(s, (_dt[i] if _dt is not None and i < len(_dt) else None))
+                            for i, s in enumerate(sizes)]
                     return "[" + ", ".join(dims) + "]"
                 return None
 

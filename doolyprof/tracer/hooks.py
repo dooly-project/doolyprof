@@ -10,7 +10,7 @@ import torch
 from torch.profiler import record_function
 
 from .types import Taint, DimTaint, TaintedInt, TaintedFloat, TaintedShape
-from .tensor import TaintedTensor
+from .tensor import TaintedTensor, _format_dim
 
 __all__ = [
     'install_hooks', 'uninstall_hooks',
@@ -208,7 +208,10 @@ def _torch_function_implementation(cls, func, types, args=(), kwargs=None):
                 if isinstance(tensor, TaintedTensor):
                     return tensor.taint_str_with_history()
                 elif isinstance(tensor, torch.Tensor):
-                    dims = [f"?({d})" for d in tensor.shape]
+                    _dt = getattr(tensor, "_dim_taints", None)
+                    _sz = torch.Tensor.size(tensor)
+                    dims = [_format_dim(s, (_dt[i] if _dt is not None and i < len(_dt) else None))
+                            for i, s in enumerate(_sz)]
                     return "[" + ", ".join(dims) + "]"
                 return None
 
@@ -367,7 +370,10 @@ def _module_call_wrapper(self, *args, **kwargs):
             if isinstance(tensor, TaintedTensor):
                 return tensor.taint_str_with_history()
             elif isinstance(tensor, torch.Tensor):
-                dims = [f"?({d})" for d in tensor.shape]
+                _dt = getattr(tensor, "_dim_taints", None)
+                _sz = torch.Tensor.size(tensor)
+                dims = [_format_dim(s, (_dt[i] if _dt is not None and i < len(_dt) else None))
+                        for i, s in enumerate(_sz)]
                 return "[" + ", ".join(dims) + "]"
             return None
 
@@ -958,7 +964,17 @@ def _wrap_view_reshape(original_fn, fn_name):
                                     output_taints.append(DimTaint(actual_taint, merge_history={actual_taint: resolved_value}))
                                     # print(f"[DEBUG @ _wrap_view_reshape] Found existing entry in registry for value {resolved_value}: {existing_entry}, pure taint")
                                 else:
-                                    raise ValueError("Registry entry is pure taint but we have multiple remaining components. Change number of tokens to prevent overlap.")
+                                    import os as _os_ab
+                                    if _os_ab.environ.get('DOOLY_ABLATE_SCALAR_GRACEFUL') == '1':
+                                        # E1 GRACEFUL mode: the scalar merge-history is gone, so the
+                                        # -1 dimension cannot be disambiguated; degrade to untainted
+                                        # instead of raising, so the ablated trace completes for
+                                        # coverage measurement. With DOOLY_ABLATE_SCALAR=1 alone
+                                        # (no _GRACEFUL) this raises, demonstrating the fail-loud
+                                        # ambiguity that a naive baseline hits at this reshape.
+                                        output_taints.append(DimTaint.from_taint(None))
+                                    else:
+                                        raise ValueError("Registry entry is pure taint but we have multiple remaining components. Change number of tokens to prevent overlap.")
                         else:
                             # Not in registry - compute from remaining and register
                             # print(f"[DEBUG @ _wrap_view_reshape] No existing entry in registry for value {resolved_value}. Computing from remaining: {remaining}")
@@ -2039,8 +2055,18 @@ def _wrap_linear(original_fn):
             if not isinstance(input, TaintedTensor):
                 return result
 
-            # If weight is not tainted, preserve batch dims and mark last dim as None
-            if not isinstance(weight, TaintedTensor):
+            # Read weight dim-taints from either a TaintedTensor or a plain
+            # Parameter carrying re-attached _dim_taints. vLLM weights are plain
+            # ModelWeightParameters (not TaintedTensor instances), so gating on
+            # isinstance(weight, TaintedTensor) alone drops their output-dim
+            # taint (e.g. QKV 6144, gate_up 28672).
+            weight_dim_taints = (
+                weight._dim_taints if isinstance(weight, TaintedTensor)
+                else getattr(weight, "_dim_taints", None)
+            )
+
+            # If weight has no usable taints, preserve batch dims, last dim None
+            if not weight_dim_taints or all(t is None for t in weight_dim_taints):
                 new_taints = input._dim_taints[:-1] + (None,)
                 return TaintedTensor(result, new_taints)
 
@@ -2056,7 +2082,7 @@ def _wrap_linear(original_fn):
 
             # SEMANTIC RULE: batch dims from input + output dim from weight[0]
             batch_taints = input._dim_taints[:-1]
-            output_dim_taint = weight._dim_taints[0]
+            output_dim_taint = weight_dim_taints[0]
 
             new_taints = batch_taints + (output_dim_taint,)
             return TaintedTensor(result, new_taints)
@@ -2696,8 +2722,17 @@ def _make_taint_aware_compiled(original_fn, original_compiled_fn):
                 dtype_strs.append(str(obj.dtype))
             elif isinstance(obj, torch.Tensor):
                 shape = tuple(torch.Tensor.size(obj))
-                input_infos.append((shape, tuple(None for _ in range(len(shape)))))
-                shape_strs.append("[" + ", ".join(f"?({d})" for d in shape) + "]")
+                # Read any _dim_taints re-attached to a plain Parameter (e.g. a
+                # torch.compile'd norm's weight) so its taints propagate and the
+                # COMPILE annotation renders MODEL_CONFIG instead of ?().
+                _dt = getattr(obj, "_dim_taints", None)
+                if _dt is not None:
+                    taints_tuple = tuple(_dt[i] if i < len(_dt) else None for i in range(len(shape)))
+                else:
+                    taints_tuple = tuple(None for _ in range(len(shape)))
+                input_infos.append((shape, taints_tuple))
+                shape_strs.append("[" + ", ".join(
+                    _format_dim(s, taints_tuple[i]) for i, s in enumerate(shape)) + "]")
                 dtype_strs.append(str(obj.dtype))
             elif isinstance(obj, (list, tuple)):
                 for x in obj:
@@ -2789,6 +2824,20 @@ def _patched_torch_compile(model=None, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Install / Uninstall
 # ---------------------------------------------------------------------------
+
+# E2 ABLATION (temporary, env-gated): swap the bespoke per-operation taint
+# handlers for identity so those ops fall back to the generic size-correspondence
+# in propagate_taints. Inert unless DISABLE_OP_TAINT_HANDLERS=1 is set.
+import os as _os_e2
+if _os_e2.environ.get('DISABLE_OP_TAINT_HANDLERS') == '1':
+    def _e2_identity(original_fn, *a, **k):
+        return original_fn
+    _wrap_view_reshape = _wrap_torch_reshape = _wrap_permute = _wrap_transpose = \
+        _wrap_cat = _wrap_stack = _wrap_split = _wrap_chunk = _wrap_unsqueeze = \
+        _wrap_squeeze = _wrap_unbind = _wrap_flatten = _wrap_expand = _wrap_matmul = \
+        _wrap_linear = _wrap_pad = _wrap_einsum = _wrap_einops_rearrange = \
+        _wrap_einops_reduce = _wrap_einops_repeat = _e2_identity
+
 
 def install_hooks(int_patch_modules=()):
     """Install hooks on tensor creation functions and enable profiler integration."""
