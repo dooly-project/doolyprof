@@ -64,7 +64,7 @@ python -m doolyprof.run.run-tracer --model meta-llama/Llama-3.1-70B --tp 4
 
 ```
 
-The tracer sets `VLLM_FAKE_TP=8` and patches vLLM's `parallel_state` and collective ops to no-ops, so the model executes on one GPU while reporting TP=4 communication shapes. 
+The tracer sets `VLLM_FAKE_TP=4` and patches vLLM's `parallel_state` and collective ops to no-ops, so the model executes on one GPU while reporting TP=4 communication shapes. 
 
 ## Repository layout
 
