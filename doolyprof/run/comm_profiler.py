@@ -26,6 +26,52 @@ DTYPE_TO_BYTES = {
 }
 
 
+def _time_collective(op_fn, warmup_iters: int, measure_iters: int,
+                     comm_timing: str = "isolated") -> float:
+    """Time a collective ``op_fn()`` (no-arg callable) and return latency in ms.
+
+    Two modes (default preserves the original per-call ISOLATED behavior):
+
+    - ``"isolated"``: each iteration does sync -> record start -> ONE collective
+      -> record end -> sync; returns the MEDIAN per-call GPU time. Every call
+      pays full NCCL kernel startup-from-idle, which overestimates the cost of
+      collectives that actually run back-to-back inside the model forward.
+
+    - ``"amortized"``: record start -> run ``measure_iters`` collectives
+      back-to-back -> record end -> ONE sync at the end; returns total / iters.
+      Kernels queue back-to-back (no per-call idle gap), closer to how the model
+      forward issues them. Additive experiment-only option.
+    """
+    # Warmup (identical for both modes)
+    for _ in range(warmup_iters):
+        op_fn()
+        torch.cuda.synchronize()
+
+    if comm_timing == "amortized":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(measure_iters):
+            op_fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        return start_event.elapsed_time(end_event) / measure_iters
+
+    # Default: isolated per-call timing, median across iters.
+    latencies = []
+    for _ in range(measure_iters):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_event.record()
+        op_fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        latencies.append(start_event.elapsed_time(end_event))
+    return float(np.median(latencies))
+
+
 # ============================================================================
 # STANDALONE WORKER FUNCTION (called via collective_rpc)
 # ============================================================================
@@ -54,6 +100,9 @@ def _run_profiling_on_worker_standalone(
     warmup_iters = config_dict['warmup_iters']
     measure_iters = config_dict['measure_iters']
     max_size = config_dict['max_size']
+    # Timing mode: "isolated" (default, per-call) or "amortized" (back-to-back).
+    comm_timing = config_dict.get('comm_timing', 'isolated')
+    print(f"[DEBUG Worker] comm_timing mode = {comm_timing}")
 
     # DEBUG: Check TP setup
     print(f"[DEBUG Worker] TP rank={tp_rank}/{tp_world_size}, dtype={dtype}")
@@ -80,34 +129,10 @@ def _run_profiling_on_worker_standalone(
                 tensor = torch.randn(size, dtype=dtype, device=device)
                 size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
 
-                # Warmup
-                for _ in range(warmup_iters):
-                    _ = tp_group.all_reduce(tensor)
-                    torch.cuda.synchronize()
-
-                # Measure
-                latencies = []
-                for _ in range(measure_iters):
-                    # Create CUDA events for GPU timing
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-
-                    # Clear any pending operations
-                    torch.cuda.synchronize()
-
-                    # Record GPU kernel execution time
-                    start_event.record()
-                    _ = tp_group.all_reduce(tensor)
-                    end_event.record()
-
-                    # Wait for completion
-                    torch.cuda.synchronize()
-
-                    # Get GPU time in milliseconds
-                    gpu_time_ms = start_event.elapsed_time(end_event)
-                    latencies.append(gpu_time_ms)
-
-                latency = np.median(latencies)
+                latency = _time_collective(
+                    lambda: tp_group.all_reduce(tensor),
+                    warmup_iters, measure_iters, comm_timing,
+                )
 
                 results.append({
                     'operation': 'all_reduce',
@@ -154,34 +179,10 @@ def _run_profiling_on_worker_standalone(
                 tensor = torch.randn(tensor_dim, dtype=dtype, device=device)
                 size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
 
-                # Warmup
-                for _ in range(warmup_iters):
-                    _ = tp_group.all_gather(tensor, dim=dim_param)
-                    torch.cuda.synchronize()
-
-                # Measure
-                latencies = []
-                for _ in range(measure_iters):
-                    # Create CUDA events for GPU timing
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-
-                    # Clear any pending operations
-                    torch.cuda.synchronize()
-
-                    # Record GPU kernel execution time
-                    start_event.record()
-                    _ = tp_group.all_gather(tensor, dim=dim_param)
-                    end_event.record()
-
-                    # Wait for completion
-                    torch.cuda.synchronize()
-
-                    # Get GPU time in milliseconds
-                    gpu_time_ms = start_event.elapsed_time(end_event)
-                    latencies.append(gpu_time_ms)
-
-                latency = np.median(latencies)
+                latency = _time_collective(
+                    lambda: tp_group.all_gather(tensor, dim=dim_param),
+                    warmup_iters, measure_iters, comm_timing,
+                )
 
                 results.append({
                     'operation': 'all_gather',
@@ -225,34 +226,10 @@ def _run_profiling_on_worker_standalone(
                 tensor = torch.randn(tensor_dim, dtype=dtype, device=device)
                 size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
 
-                # Warmup
-                for _ in range(warmup_iters):
-                    _ = tp_group.reduce_scatter(tensor, dim=dim_param)
-                    torch.cuda.synchronize()
-
-                # Measure
-                latencies = []
-                for _ in range(measure_iters):
-                    # Create CUDA events for GPU timing
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-
-                    # Clear any pending operations
-                    torch.cuda.synchronize()
-
-                    # Record GPU kernel execution time
-                    start_event.record()
-                    _ = tp_group.reduce_scatter(tensor, dim=dim_param)
-                    end_event.record()
-
-                    # Wait for completion
-                    torch.cuda.synchronize()
-
-                    # Get GPU time in milliseconds
-                    gpu_time_ms = start_event.elapsed_time(end_event)
-                    latencies.append(gpu_time_ms)
-
-                latency = np.median(latencies)
+                latency = _time_collective(
+                    lambda: tp_group.reduce_scatter(tensor, dim=dim_param),
+                    warmup_iters, measure_iters, comm_timing,
+                )
 
                 dim0 = tensor_dim[0] if len(tensor_dim) > 0 else None
                 dim1 = tensor_dim[1] if len(tensor_dim) > 1 else None
@@ -273,6 +250,88 @@ def _run_profiling_on_worker_standalone(
 
         print(f"✓ Completed reduce_scatter profiling")
 
+    # Profile send/recv (pipeline-parallel stage boundary), through vLLM's group
+    # coordinator -- same path as all_reduce above, identical to what PP pays.
+    if profile_flags.get('send_recv', False):
+        if tp_world_size != 2:
+            print(f"[WARN] Skipping send_recv: requires exactly 2 ranks, got {tp_world_size}")
+        else:
+            print("Profiling send_recv...")
+            for size in sizes:
+                try:
+                    tensor = torch.randn(size, dtype=dtype, device=device)
+                    size_bytes = tensor.numel() * DTYPE_TO_BYTES[dtype]
+
+                    def _p2p():
+                        # dst/src are LOCAL ranks within the 2-rank group
+                        if tp_rank == 0:
+                            tp_group.send(tensor, dst=1)
+                        else:
+                            tp_group.recv(tensor.size(), dtype, src=0)
+
+                    latency = _time_collective(
+                        _p2p, warmup_iters, measure_iters, comm_timing,
+                    )
+
+                    results.append({
+                        'operation': 'send_recv',
+                        'topology': topology,
+                        'backend': backend,
+                        'tp_size': tp_size,
+                        'size_bytes': size_bytes,
+                        'dtype': dtype_str,
+                        'dim_param': None,
+                        'num_dims': 1,
+                        'latency_ms': latency
+                    })
+                except Exception as e:
+                    raise ValueError(f"Error profiling send_recv (size={size}): {e}")
+
+            print(f"✓ Completed send_recv profiling")
+
+    # Profile all-to-all (expert-parallel dispatch/combine). The group coordinator has
+    # no all_to_all method, so use torch.distributed.all_to_all_single on the group's
+    # NCCL process group. Keyed by per-rank message size, like the other collectives.
+    if profile_flags.get('all_to_all', False):
+        if tp_world_size < 2:
+            print(f"[WARN] Skipping all_to_all: requires >= 2 ranks, got {tp_world_size}")
+        else:
+            import torch.distributed as dist
+            print("Profiling all_to_all...")
+            group = tp_group.device_group
+            for size in sizes:
+                try:
+                    # all_to_all_single requires the buffer be divisible by world_size
+                    n = (size // tp_world_size) * tp_world_size
+                    if n == 0:
+                        continue
+                    inp = torch.randn(n, dtype=dtype, device=device)
+                    out = torch.empty_like(inp)
+                    size_bytes = inp.numel() * DTYPE_TO_BYTES[dtype]
+
+                    def _a2a():
+                        dist.all_to_all_single(out, inp, group=group)
+
+                    latency = _time_collective(
+                        _a2a, warmup_iters, measure_iters, comm_timing,
+                    )
+
+                    results.append({
+                        'operation': 'all_to_all',
+                        'topology': topology,
+                        'backend': backend,
+                        'tp_size': tp_size,
+                        'size_bytes': size_bytes,
+                        'dtype': dtype_str,
+                        'dim_param': None,
+                        'num_dims': 1,
+                        'latency_ms': latency
+                    })
+                except Exception as e:
+                    raise ValueError(f"Error profiling all_to_all (size={size}): {e}")
+
+            print(f"✓ Completed all_to_all profiling")
+
     return results
 
 
@@ -285,6 +344,10 @@ class CommProfilingConfig:
     max_req_count: int = 256
     max_seq_len: int = 8192
     max_size: int = max_seq_len * 1024 * 1024
+    # Timing mode for collectives: "isolated" (default, per-call synced median)
+    # or "amortized" (measure_iters back-to-back between two events, single
+    # sync, divided by iters). Additive experiment-only option.
+    comm_timing: str = "isolated"
     
     def __post_init__(self):
         if self.dtype is None:
@@ -430,6 +493,7 @@ class CommProfiler:
         self.profile_all_reduce_bool: bool = True if self.plan_info.get('all_reduce', None) else False
         self.profile_all_gather_bool: bool = True if self.plan_info.get('all_gather', None) else False
         self.profile_reduce_scatter_bool: bool = True if self.plan_info.get('reduce_scatter', None) else False
+        self.profile_send_recv_bool: bool = False  # enabled by the worker for PP profiling
 
     def profile(
         self,
@@ -470,6 +534,7 @@ class CommProfiler:
             'warmup_iters': config.warmup_iters,
             'measure_iters': config.measure_iters,
             'max_size': config.max_size,
+            'comm_timing': getattr(config, 'comm_timing', 'isolated'),
         }
 
         # Prepare profile flags
@@ -477,6 +542,7 @@ class CommProfiler:
             'all_reduce': self.profile_all_reduce_bool,
             'all_gather': self.profile_all_gather_bool,
             'reduce_scatter': self.profile_reduce_scatter_bool,
+            'send_recv': getattr(self, 'profile_send_recv_bool', False),
         }
 
         # Call standalone function (not instance method) to avoid serialization issues

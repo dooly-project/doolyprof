@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
                         help="Force re-profiling of communication operations")
     parser.add_argument("--no-cuda-graph-comm", action="store_true",
                         help="Disable CUDA graph profiling for communication operations")
+    parser.add_argument("--comm-timing", choices=["isolated", "amortized"], default="isolated",
+                        help="Collective timing mode for the comm profiler: 'isolated' "
+                             "(default, per-call synced median) or 'amortized' (measure_iters "
+                             "back-to-back between two CUDA events, single sync, divided by iters).")
     return parser.parse_args()
 
 
@@ -138,7 +142,7 @@ def resolve_model(model, dtype, attention_backend, flash_attn_version, quantizat
     vlp.close()
     print(f"=== Resolution complete for {model.name} ({dtype}) ({attention_backend}) ===\n")
 
-def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_method="cuda_event", use_cuda_graph=True):
+def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_method="cuda_event", use_cuda_graph=True, comm_timing="isolated"):
     """Run comm profiler via subprocess with clean environment (no fake TP)."""
     import subprocess
     import pickle
@@ -190,6 +194,10 @@ def run_comm_profiler(models, dtype_str, tp_size, db_path, overwrite, profile_me
 
         if overwrite:
             cmd.append('--overwrite')
+
+        # Amortized timing option is implemented in comm_worker.py (cuda_event path).
+        if profile_method not in ["kineto", "wall_clock"]:
+            cmd.extend(['--comm-timing', comm_timing])
 
         result = subprocess.run(
             cmd,
@@ -276,7 +284,8 @@ def main() -> None:
             db_path=args.db_path,
             overwrite=args.overwrite_comm,
             profile_method=args.profile_method,
-            use_cuda_graph=not args.no_cuda_graph_comm  # Default True unless disabled
+            use_cuda_graph=not args.no_cuda_graph_comm,  # Default True unless disabled
+            comm_timing=args.comm_timing,
         )
     
     elapsed_s = time.perf_counter() - start_time    

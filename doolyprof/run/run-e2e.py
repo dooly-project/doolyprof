@@ -5,6 +5,22 @@ import argparse
 import subprocess
 
 
+# Tracing prompt. Long enough that avg_packed_qo_len (tokens-per-request x GQA
+# group size) clears FlashInfer's cta_tile_q threshold of 64, so the dispatched
+# kernel symbol -- and therefore the operation signature -- does not depend on
+# how a model's tokenizer happens to render the prompt. With the previous short
+# default, Qwen2.5-32B and DeepSeek-R1-Distill-Qwen-32B (both 40q/8kv, group 5)
+# tokenized to 12 vs 13 tokens, landing at 60 vs 65 and selecting tile 64 vs
+# 128, which split the attention signature of two architecturally identical
+# models. Override with DOOLY_TRACE_PROMPT if needed.
+DEFAULT_TRACE_PROMPT = (
+    "Hello, how are you? I am fine, and I hope that you are also doing well "
+    "today. The weather here is quite pleasant, so I decided to take a long "
+    "walk through the park this morning before starting my work. "
+)
+TRACE_PROMPT = os.environ.get("DOOLY_TRACE_PROMPT", DEFAULT_TRACE_PROMPT)
+
+
 def model_to_dirname(model: str) -> str:
     """Convert model name to a safe directory name."""
     return model.replace("/", "_").replace(".", "_")
@@ -28,6 +44,11 @@ def run_tracer(model: str, tp: int, trace_dir: str, dtype: str, gpu: int, attent
         "--dtype", dtype,
         "--gpu", str(gpu),
         "--attention-backend", attention_backend,
+        "--prompts", TRACE_PROMPT,
+        # Trace at batch 7: batch 5 gives cu_seqlens=6 which collides with
+        # top_k=6 in DeepSeek-V2-Lite's MLA taint propagation. 7 -> cu_seqlens=8,
+        # avoiding the collision so MLA models trace via the scenario driver.
+        "--batch-size", "7",
     ]
     if tokenizer:
         cmd.extend(["--tokenizer", tokenizer])
