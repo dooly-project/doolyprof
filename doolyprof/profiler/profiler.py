@@ -445,8 +445,9 @@ class Profiler:
                 is_prefill BOOLEAN NULL,
                 kv_cache_size INTEGER NULL,
                 prefill_chunk_size INTEGER NULL,
+                activated_experts INTEGER NULL,
                 num_tensor_parallel_workers INTEGER,
-                input_shapes TEXT, 
+                input_shapes TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (signature_hash) REFERENCES signatures(signature_hash)
             )
@@ -455,11 +456,17 @@ class Profiler:
         # Without this, the per-row "does this exact (sig, workload_params) row
         # already exist?" SELECT degrades to a full scan, making the write
         # phase O(N²) in result-row count. With it: O(N log N).
+        # Backward-compat: add activated_experts to a pre-existing results table
+        # (CREATE TABLE IF NOT EXISTS won't add a column to an existing table).
+        try:
+            conn.execute("ALTER TABLE results ADD COLUMN activated_experts INTEGER NULL")
+        except sqlite3.OperationalError:
+            pass  # column already present
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_results_lookup
             ON results (signature_hash, num_tokens, num_requests,
                         is_context, is_prefill, kv_cache_size,
-                        prefill_chunk_size, num_tensor_parallel_workers)
+                        prefill_chunk_size, activated_experts, num_tensor_parallel_workers)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS profiled_models (
@@ -976,12 +983,22 @@ class Profiler:
                 else:
                     layer_name = self.module_caller.get_layer_name_by_module(module.operation_name, name_to_module)
 
+            # MoE 2-D sweep: if this module is (or contains) a FusedMoE, read top_k /
+            # num_experts from the live layer so the InputGenerator builds the
+            # (num_tokens, activated_experts) grid and we can force routing when timing.
+            from doolyprof.profiler.moe_hook import find_fused_moe
+            fused_moe = find_fused_moe(callable_obj) if module.is_module else None
+            moe_top_k = getattr(fused_moe, "top_k", None) if fused_moe is not None else None
+            moe_num_experts = getattr(fused_moe, "global_num_experts", None) if fused_moe is not None else None
+
             generator = InputGenerator(
                 module=module,
                 max_num_request=self.max_batch_size,
                 max_num_token=limit,
                 test_counts=self.attention_config["test_counts"],
                 dtype=self.dtype,
+                moe_top_k=moe_top_k,
+                moe_num_experts=moe_num_experts,
             )
 
             # Let the InputGenerator classify the op and pick the right sweep.
@@ -1024,6 +1041,15 @@ class Profiler:
                 # _create_tensor_inputs_from_params now accepts AttentionBatchConfig or Dict[str, int]
                 # and returns (inputs, workload_params)
                 inputs, workload_params = generator._create_tensor_inputs_from_params(workload_config)
+
+                # MoE 2-D grid carries activated_experts in the config dict; thread it
+                # into workload_params so it is stored and used to force routing below.
+                activated_experts = (
+                    workload_config.get('activated_experts')
+                    if isinstance(workload_config, dict) else None
+                )
+                if activated_experts is not None:
+                    workload_params['activated_experts'] = activated_experts
 
                 if not inputs:
                     # Invalid config, skip
@@ -1142,6 +1168,24 @@ class Profiler:
                             warmup_runs=5,
                             profile_runs=20
                         )
+                    elif fused_moe is not None and activated_experts is not None:
+                        # Force exactly `activated_experts` distinct experts to fire, then
+                        # time with the batched CUDA-graph method (same as every other op)
+                        # so per-call kernel-launch overhead is amortized by graph replay.
+                        # Eager per-call timing is launch-bound at low token counts and
+                        # overestimates decode MoE ~7x (real decode runs in a full cudagraph).
+                        # force_moe_routing must wrap BOTH capture and replay so the forged
+                        # routing is in effect while the graph is captured; the graph then
+                        # replays those exact kernels. _profile_with_batched_cuda_graph
+                        # falls back to _profile_standard internally if capture fails.
+                        from doolyprof.profiler.moe_hook import force_moe_routing
+                        with force_moe_routing(fused_moe, workload_params.get('num_tokens'), activated_experts):
+                            run_results = self._profile_with_batched_cuda_graph(
+                                run_fn=run_fn,
+                                warmup_runs=5,
+                                profile_runs=20,
+                                iterations_per_graph=10
+                            )
                     else:
                         # Use batched CUDA graph profiling for other operations
                         run_results = self._profile_with_batched_cuda_graph(
@@ -1170,6 +1214,7 @@ class Profiler:
                         "workload_params": workload_params,
                         "num_tokens": workload_params.get('num_tokens'),
                         "num_requests": workload_params.get('num_requests'),
+                        "activated_experts": workload_params.get('activated_experts'),
                     }
                     results.append(result)
 
@@ -1204,7 +1249,7 @@ class Profiler:
         with open(self.output_path, "w") as f:
             f.write(
                 "module_name,operation_name,num_tensor_parallel_workers,"
-                "num_tokens,num_requests,"
+                "num_tokens,num_requests,activated_experts,"
                 "mean_latency_ms,median_latency_ms,max_latency_ms,min_latency_ms,std_latency_ms,"
                 "input_shapes,workload_params\n"
             )
@@ -1212,9 +1257,12 @@ class Profiler:
                 workload_params_str = str(result.get("workload_params", {}))
                 num_tokens = result.get("num_tokens", "")
                 num_requests = result.get("num_requests", "")
+                activated_experts = result.get("activated_experts", "")
+                if activated_experts is None:
+                    activated_experts = ""
                 f.write(
                     f"{result['module_name']},{result['operation_name']},{self.tp_config},"
-                    f"{num_tokens},{num_requests},"
+                    f"{num_tokens},{num_requests},{activated_experts},"
                     f"{result['mean_latency_ms']:.4f},{result['median_latency_ms']:.4f},"
                     f"{result['max_latency_ms']:.4f},{result['min_latency_ms']:.4f},{result['std_latency_ms']:.4f},"
                     f"\"{result['input_shapes']}\",\"{workload_params_str}\"\n"
@@ -1486,6 +1534,7 @@ class Profiler:
                 is_prefill = workload_params.get('is_prefill', None)
                 prefill_chunk_size = workload_params.get('prefill_chunk_size', None)
                 kv_cache_size = workload_params.get('kv_cache_size', None)
+                activated_experts = workload_params.get('activated_experts', None)
                 is_context = is_prefill is not None and kv_cache_size is not None and prefill_chunk_size is not None
 
                 # Check if this exact configuration already exists
@@ -1499,6 +1548,7 @@ class Profiler:
                        AND (is_prefill = ? OR (is_prefill IS NULL AND ? IS NULL))
                        AND (kv_cache_size = ? OR (kv_cache_size IS NULL AND ? IS NULL))
                        AND (prefill_chunk_size = ? OR (prefill_chunk_size IS NULL AND ? IS NULL))
+                       AND (activated_experts = ? OR (activated_experts IS NULL AND ? IS NULL))
                        AND num_tensor_parallel_workers = ?""",
                     (sig_hash,
                      num_tokens, num_tokens,
@@ -1507,6 +1557,7 @@ class Profiler:
                      is_prefill, is_prefill,
                      kv_cache_size, kv_cache_size,
                      prefill_chunk_size, prefill_chunk_size,
+                     activated_experts, activated_experts,
                      tp_workers)
                 ).fetchone()
 
@@ -1536,9 +1587,10 @@ class Profiler:
                             mean_latency_ms, median_latency_ms, max_latency_ms, min_latency_ms, std_latency_ms,
                             num_tokens, num_requests,
                             is_context, is_prefill, kv_cache_size, prefill_chunk_size,
+                            activated_experts,
                             num_tensor_parallel_workers,
                             input_shapes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             sig_hash,
                             result.get('mean_latency_ms'),
@@ -1552,6 +1604,7 @@ class Profiler:
                             is_prefill,
                             kv_cache_size,
                             prefill_chunk_size,
+                            activated_experts,
                             tp_workers,
                             json.dumps(result.get('input_shapes', [])),
                         )

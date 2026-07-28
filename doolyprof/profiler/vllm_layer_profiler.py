@@ -245,11 +245,32 @@ class VLLMLayerProfiler:
         Returns:
             Tuple of (builder, attn_group, kv_cache_group_id)
         """
+        # 1) Exact match: the queried name is registered verbatim in an
+        #    attn_group (normal MHA, e.g. 'model.layers.0.self_attn.attn').
         for kv_cache_gid, attn_group_list in enumerate(self.attn_groups):
             for attn_gid, attn_group in enumerate(attn_group_list):
                 if layer_name in attn_group.layer_names:
                     builder = attn_group.get_metadata_builder(0)
                     return builder, attn_group, kv_cache_gid
+        # 2) Fallback for wrapped attention (e.g. MLA): the module's attribute
+        #    path differs from the name vLLM registers in attn_groups. For
+        #    DeepSeek-V2 MLA the module path is
+        #    'model.layers.N.self_attn.mla_attn.mla_attn' while the registered
+        #    name is 'model.layers.N.self_attn.attn'. Both share the
+        #    '...self_attn' prefix for the same layer, which uniquely selects
+        #    that layer's attention, so match on that prefix.
+        def _attn_prefix(name: str):
+            marker = '.self_attn'
+            idx = name.find(marker)
+            return name[: idx + len(marker)] if idx != -1 else None
+        want = _attn_prefix(layer_name)
+        if want is not None:
+            for kv_cache_gid, attn_group_list in enumerate(self.attn_groups):
+                for attn_gid, attn_group in enumerate(attn_group_list):
+                    for reg in attn_group.layer_names:
+                        if _attn_prefix(reg) == want:
+                            builder = attn_group.get_metadata_builder(0)
+                            return builder, attn_group, kv_cache_gid
         raise ValueError(f"No metadata builder found for layer: {layer_name}")
 
     def _get_or_create_block_table(

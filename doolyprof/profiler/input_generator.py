@@ -30,7 +30,10 @@ def classify_op(module: ModuleInfo) -> str:
     name = module.module_name or ""
     if is_attention_operation(module):
         return "attention"
-    for tok in ("FusedMoE", "SharedFusedMoE", "MoE"):
+    # Match both "MoE" (FusedMoE, SharedFusedMoE, MixtralMoE, DeepseekV2MoE) and
+    # "Moe" (Qwen2MoeSparseMoeBlock, ...SparseMoeBlock) so MoE wrappers are not
+    # misclassified as 'stateless'.
+    for tok in ("FusedMoE", "SharedFusedMoE", "MoE", "Moe"):
         if tok in name:
             return "moe"
     for tok in ("Mamba", "MambaMixer"):
@@ -44,7 +47,8 @@ class InputGenerator:
     # for a given ModuleInfo, generate the inputs needed to profile
     def __init__(self, module: ModuleInfo, max_num_request: int=16,
                  max_num_token: int=1024, min_num_requests:int=1, test_counts: int=10,
-                 dtype: torch.dtype = torch.bfloat16):
+                 dtype: torch.dtype = torch.bfloat16,
+                 moe_top_k: Optional[int] = None, moe_num_experts: Optional[int] = None):
         self.module = module
         self.max_num_request = max_num_request
         self.max_num_token = max_num_token
@@ -53,6 +57,10 @@ class InputGenerator:
         self.seen_batches = set()
         self.dtype = dtype
         self.min_num_requests = min_num_requests
+        # MoE 2-D sweep params, set by the profiler from the live FusedMoE module
+        # (input_generator only has the ModuleInfo, not the live module/config).
+        self.moe_top_k = moe_top_k
+        self.moe_num_experts = moe_num_experts
 
         self.dtype_map = {
             "float32": torch.float32,
@@ -301,14 +309,34 @@ class InputGenerator:
         return self.batches
 
     def _prepare_moe_inputs(self, mode: str) -> List[Dict[str, int]]:
-        """1-D sweep over num_tokens. MoE latency is empirically a function of
-        num_tokens only — kv_cache_size and prefill_chunk_size don't matter.
+        """2-D sweep over (num_tokens, activated_experts). MoE-block latency depends
+        on the token count and on how many distinct experts are activated (few experts
+        with many tokens each vs many experts with few tokens each) — LLMServingSim's
+        ExpertCategory. kv_cache_size / prefill_chunk_size don't matter.
+
+        `activated_experts` is a power-of-two grid in [top_k, min(num_experts,
+        num_tokens*top_k)]; the profiler forces exactly that many experts to fire
+        (see moe_hook.force_moe_routing) when timing each config. If MoE params
+        (top_k, num_experts) were not supplied by the profiler, fall back to the 1-D
+        num_tokens sweep (routing is then left to the dummy-weight gate).
         """
         num_tokens_sweep = self._generate_num_tokens_sweep()
-        self.batches = [
-            {"num_tokens": n, "num_requests": 1}
-            for n in num_tokens_sweep
-        ]
+        if self.moe_top_k is None or self.moe_num_experts is None:
+            self.batches = [
+                {"num_tokens": n, "num_requests": 1} for n in num_tokens_sweep
+            ]
+            return self.batches
+
+        from doolyprof.profiler.moe_hook import moe_activated_grid
+        configs = []
+        for n in num_tokens_sweep:
+            for activated in moe_activated_grid(self.moe_top_k, self.moe_num_experts, n):
+                configs.append({
+                    "num_tokens": n,
+                    "num_requests": 1,
+                    "activated_experts": activated,
+                })
+        self.batches = configs
         return self.batches
 
     def _prepare_mamba_inputs(self, mode: str) -> List[Dict[str, int]]:
