@@ -57,6 +57,36 @@ class TraceLoader:
             json.dump(data, f, indent=2)
 
 
+def _derive_op_dtype(inputs, fallback: str = "") -> str:
+    """Compute dtype of an op from its traced tensor inputs.
+
+    Uses the dtype of the first floating-point tensor input (the activation
+    dtype the kernel computes in), else the first tensor input's dtype, else
+    ``fallback``. Trace dtype strings (``c10::BFloat16``, ``torch.float16``,
+    ``long int`` ...) are resolved through the same mapping the input
+    generator uses to materialise tensors, and named by torch
+    (``str(torch.dtype)`` without the ``torch.`` prefix), so the value is
+    identical whether the op was traced as a raw op or inside a MODULE
+    annotation.
+    """
+    from doolyprof.profiler.input_generator import trace_dtype_to_torch, canonical_dtype_name
+
+    first_tensor = None
+    for inp in inputs or []:
+        if getattr(inp, "type", None) != "Tensor" or not getattr(inp, "dtype", None):
+            continue
+        td = trace_dtype_to_torch(inp.dtype)
+        if td is None:
+            continue
+        if td.is_floating_point:
+            return canonical_dtype_name(td)
+        if first_tensor is None:
+            first_tensor = td
+    if first_tensor is not None:
+        return canonical_dtype_name(first_tensor)
+    return fallback
+
+
 class TraceParser:
     def __init__(self, loader: Optional[TraceLoader] = None) -> None:
         self.loader = loader or TraceLoader()
@@ -140,7 +170,10 @@ class TraceParser:
         print("Making module infos from operation hierarchies...")
         profile_metadata = profile_metadata or {}
         backend = profile_metadata.get("backend", "")
-        dtype = profile_metadata.get("dtype", "bfloat16")
+        # Per-op dtype is derived from the op's own traced inputs (see
+        # _derive_op_dtype); the metadata value is only a fallback for ops
+        # whose inputs carry no tensor dtype.
+        fallback_dtype = profile_metadata.get("dtype", "bfloat16")
 
         # --- DEBUG-TRACE: per-reason drop counters + per-op tallies ---
         from collections import Counter as _TCounter
@@ -287,7 +320,7 @@ class TraceParser:
                 operation_name=op_name,
                 inputs=inputs,
                 backend=backend,
-                dtype=dtype,
+                dtype=_derive_op_dtype(inputs, fallback_dtype),
                 is_module=is_module,
                 is_collective_op=is_collective,
                 hierarchy=hierarchy,
@@ -478,6 +511,7 @@ class TraceParser:
                 kernel_tuple,
                 module_kernel_tuple,
                 state_hash,
+                info.dtype,
             )
 
             # dictionary of lists that group module infos by signature
@@ -491,6 +525,7 @@ class TraceParser:
             _kernel_tuple,
             _module_kernel_tuple,
             _state_hash,
+            _dtype,
         ), infos in groups.items():
             # use the first info as template since all have same signature
             template = infos[0]

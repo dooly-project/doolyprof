@@ -34,9 +34,9 @@ hierarchy_output.json
 *.pdf
 *.pkl
 
-# Local working dirs
+# Local working dirs (root-level scratch; the package's own tests live in doolyprof/tests/)
 local/
-tests/
+/tests/
 
 # CLAUDE / agent files
 .claude/

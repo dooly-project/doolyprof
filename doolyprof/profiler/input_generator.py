@@ -4,6 +4,59 @@ import torch
 
 from doolyprof.profiler.utils.generate_batch import (generate_vidur_inputs, generate_vidur_num_tokens, AttentionBatchConfig, get_attention_batch_sizes_to_profile)
 
+
+# Trace dtype strings -> torch dtypes. Kineto writes C++ names for raw ops
+# ("c10::BFloat16", "long int"), the tracer's MODULE annotation writes
+# "torch.*" names. Shared by the input generator (to materialise tensors)
+# and by the trace parser (to name each op's dtype in its signature), so the
+# two can never disagree.
+TRACE_DTYPE_MAP: Dict[str, Optional[torch.dtype]] = {
+    "float32": torch.float32,
+    "float": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "c10::BFloat16": torch.bfloat16,
+    "long": torch.long,
+    "long int": torch.long,
+    "int": torch.int32,
+    "int32": torch.int32,
+    "int64": torch.long,
+    "bool": torch.bool,
+    "double": torch.float64,
+    "trace_dtype": None,
+    # torch.* prefixed variants (from MODULE DTYPES section)
+    "torch.float32": torch.float32,
+    "torch.float16": torch.float16,
+    "torch.bfloat16": torch.bfloat16,
+    "torch.int32": torch.int32,
+    "torch.int64": torch.long,
+    "torch.long": torch.long,
+    "torch.bool": torch.bool,
+    "torch.float64": torch.float64,
+}
+
+
+def trace_dtype_to_torch(dtype_str: str) -> Optional[torch.dtype]:
+    """Resolve a trace dtype string to a torch dtype, or None if unknown.
+
+    Falls back to torch's own dtype names for anything not in the table:
+    ``c10::Half`` -> ``torch.half``, ``c10::Float8_e4m3fn`` ->
+    ``torch.float8_e4m3fn``, ``torch.uint8`` -> ``torch.uint8``.
+    """
+    if not dtype_str:
+        return None
+    if dtype_str in TRACE_DTYPE_MAP:
+        return TRACE_DTYPE_MAP[dtype_str]
+    name = dtype_str.split("::")[-1].split(".")[-1].lower()
+    cand = getattr(torch, name, None)
+    return cand if isinstance(cand, torch.dtype) else None
+
+
+def canonical_dtype_name(dtype: torch.dtype) -> str:
+    """torch's name for a dtype without the ``torch.`` prefix (``bfloat16``,
+    ``float16``, ``int64`` ...), used as the dtype field of a signature."""
+    return str(dtype).split(".")[-1]
+
 def is_attention_operation(module: ModuleInfo) -> bool:
     attention_ops = [
         "attention", "Attention", "atten", "Atten", "attn", "Attn"
@@ -62,30 +115,7 @@ class InputGenerator:
         self.moe_top_k = moe_top_k
         self.moe_num_experts = moe_num_experts
 
-        self.dtype_map = {
-            "float32": torch.float32,
-            "float": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "c10::BFloat16": torch.bfloat16,
-            "long": torch.long,
-            "long int": torch.long,
-            "int": torch.int32,
-            "int32": torch.int32,
-            "int64": torch.long,
-            "bool": torch.bool,
-            "double": torch.float64,
-            "trace_dtype": None,
-            # torch.* prefixed variants (from MODULE DTYPES section)
-            "torch.float32": torch.float32,
-            "torch.float16": torch.float16,
-            "torch.bfloat16": torch.bfloat16,
-            "torch.int32": torch.int32,
-            "torch.int64": torch.long,
-            "torch.long": torch.long,
-            "torch.bool": torch.bool,
-            "torch.float64": torch.float64,
-        }
+        self.dtype_map = TRACE_DTYPE_MAP
 
     def _parse_scalar_value(self, scalar_str: str) -> Any:
         """

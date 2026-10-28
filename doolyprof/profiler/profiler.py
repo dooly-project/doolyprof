@@ -192,8 +192,12 @@ class Profiler:
         world_config: Optional[Dict[str, int]] = None,
         db_path: Optional[str] = None,
         gpu: str = "0",
+        kv_cache_dtype: str = "auto",
     ):
         self.importer = OpImporter()
+        # vLLM KV-cache dtype literal; part of the deployment key in
+        # profiled_models and forwarded to the vLLM instance used for timing.
+        self.kv_cache_dtype = kv_cache_dtype
         self.module_caller = None
         self.output_path = output_path
         self.db_path = db_path
@@ -476,16 +480,25 @@ class Profiler:
                 backend TEXT NOT NULL,
                 tp_degree INTEGER NOT NULL,
                 dtype TEXT NOT NULL,
+                kv_cache_dtype TEXT NOT NULL DEFAULT 'auto',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Enforce uniqueness on the (model, backend, tp, dtype) tuple. Must be
-        # an INDEX rather than an inline UNIQUE constraint so it can be added
-        # to existing DBs without recreating the table; existing rows missing
-        # a dtype value are backfilled from a one-shot ALTER TABLE migration.
+        # Backward-compat: pre-existing DBs lack kv_cache_dtype; every row in
+        # them was profiled with vLLM's default ("auto").
+        try:
+            conn.execute("ALTER TABLE profiled_models ADD COLUMN kv_cache_dtype TEXT NOT NULL DEFAULT 'auto'")
+        except sqlite3.OperationalError:
+            pass  # column already present
+        # Enforce uniqueness on the (model, backend, tp, dtype, kv_cache_dtype)
+        # deployment tuple. Must be an INDEX rather than an inline UNIQUE
+        # constraint so it can be added to existing DBs without recreating the
+        # table. The pre-kv_cache_dtype index is dropped so two cache dtypes of
+        # the same model can coexist.
+        conn.execute("DROP INDEX IF EXISTS ix_profiled_models_unique")
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique
-                ON profiled_models(model_name, backend, tp_degree, dtype)
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_profiled_models_unique_v2
+                ON profiled_models(model_name, backend, tp_degree, dtype, kv_cache_dtype)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS model_operations (
@@ -765,6 +778,7 @@ class Profiler:
             flash_attn_version=self.flash_attn_version,
             quantization=self.quantization,
             gpu=self.gpu,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
 
         # Re-resolve callables with loaded model. Pass the taint_registry
@@ -1292,23 +1306,24 @@ class Profiler:
                 # Check if this model configuration already exists
                 cursor = conn.execute(
                     """SELECT model_id FROM profiled_models
-                       WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ? AND dtype = ?""",
-                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str)
+                       WHERE model_name = ? AND model_family = ? AND backend = ? AND tp_degree = ? AND dtype = ?
+                       AND kv_cache_dtype = ?""",
+                    (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype)
                 )
                 existing = cursor.fetchone()
 
                 if existing:
                     # Model already exists, use existing model_id
                     model_id = existing[0]
-                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, dtype={dtype_str}) already exists (model_id={model_id})")
+                    print(f"[PROFILER] Model {model.name} (backend={self.attention_backend}, tp={self.tp_config}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype}) already exists (model_id={model_id})")
                 else:
                     # Insert new model and get the auto-generated model_id
                     cursor = conn.execute(
-                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype) VALUES (?, ?, ?, ?, ?)""",
-                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str)
+                        """INSERT INTO profiled_models (model_name, model_family, backend, tp_degree, dtype, kv_cache_dtype) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (model.name, model.model_family, self.attention_backend, self.tp_config, dtype_str, self.kv_cache_dtype)
                     )
                     model_id = cursor.lastrowid
-                    print(f"[PROFILER] Created new model entry (model_id={model_id}, dtype={dtype_str})")
+                    print(f"[PROFILER] Created new model entry (model_id={model_id}, dtype={dtype_str}, kv_cache_dtype={self.kv_cache_dtype})")
 
                 # Use all_resolved_ops which contains ALL operations this model uses
                 # (not just the ones that need profiling).

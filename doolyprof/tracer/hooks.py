@@ -292,6 +292,25 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
         including them would fragment signatures uselessly per layer)
       - private attrs (keys starting with ``_``)
 
+    On top of the primitive attrs, ``_engine_config_state`` appends the
+    behaviour-affecting configuration that the serving engine stores in
+    non-primitive form. Which attributes count is taken from the engine's
+    own definitions rather than from a fixed list here:
+      - string attrs whose value is one of vLLM's cache-dtype literals
+        (``CacheDType`` / ``MambaDType``), e.g. ``kv_cache_dtype``,
+        canonicalised through the engine's own resolution (``auto`` ->
+        the resolved ``kv_cache_torch_dtype``, bare ``fp8`` -> the
+        platform's ``fp8_dtype()``)
+      - ``Enum`` attrs (e.g. ``attn_type``, ``backend``) by value
+      - the attributes of ``module.impl`` named by the backend
+        implementation's ``__init__`` parameters (the engine's per-layer
+        attention contract: ``logits_soft_cap``, ``alibi_slopes``,
+        ``sinks`` ...); tensors contribute shape only
+      - for modules holding a vLLM ``CacheConfig`` (Mamba mixers), its
+        fields typed ``MambaDType``, resolved against the model dtype
+    Without this, an fp8 KV cache or a soft-capped attention layer hashes
+    identically to its bf16 / uncapped twin.
+
     Returns a 12-char hex digest, or ``""`` if no capturable attrs exist
     (keeps old signature behavior for modules that have nothing relevant).
     """
@@ -343,9 +362,158 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
         and k not in _NON_CONFIG_ATTRS
         and is_primitive(v)
     )
-    if not canonical:
+    engine = _engine_config_state(module, d, _NON_CONFIG_ATTRS, is_primitive, canonicalize)
+    if not canonical and not engine:
         return ""
-    return hashlib.blake2b(repr(canonical).encode(), digest_size=6).hexdigest()
+    return hashlib.blake2b(repr(canonical + engine).encode(), digest_size=6).hexdigest()
+
+
+@functools.lru_cache(maxsize=None)
+def _engine_cache_dtype_literals():
+    """The engine's own set of cache-dtype literals (empty if vLLM is absent)."""
+    try:
+        import typing
+        from vllm.config.cache import CacheDType, MambaDType
+        return frozenset(typing.get_args(CacheDType)) | frozenset(typing.get_args(MambaDType))
+    except Exception:
+        return frozenset()
+
+
+def _canonical_cache_dtype(value: str, module) -> str:
+    """Resolve a cache-dtype literal to the torch dtype the engine computes
+    in, named ``str(torch.dtype)``; literals the engine cannot resolve are
+    returned unchanged.
+
+    - ``auto`` means "the model dtype": vLLM stores the resolution on the
+      layer as ``kv_cache_torch_dtype`` (``kv_cache_dtype_str_to_dtype``).
+    - fp8 flavours: torch names the element type (``torch.float8_e5m2``);
+      bare ``fp8`` and ``e4m3`` are the platform's preferred fp8 type
+      (``current_platform.fp8_dtype()``, e4m3fn on CUDA, fnuz on ROCm),
+      which is exactly how vLLM's backends treat them.
+    - anything else goes through vLLM's ``STR_DTYPE_TO_TORCH_DTYPE`` when
+      that yields an element type (``bfloat16``); the fp8 entries there
+      are storage types (``uint8``) and are not used.
+    """
+    if value == "auto":
+        resolved = getattr(module, "kv_cache_torch_dtype", None)
+        return str(resolved) if isinstance(resolved, torch.dtype) else value
+    if value.startswith("fp8"):
+        flavor = value[4:] if value.startswith("fp8_") else ""
+        td = getattr(torch, f"float8_{flavor}", None) if flavor else None
+        if not isinstance(td, torch.dtype) and flavor in ("", "e4m3"):
+            try:
+                from vllm.platforms import current_platform
+                td = current_platform.fp8_dtype()
+            except Exception:
+                td = None
+        return str(td) if isinstance(td, torch.dtype) else value
+    try:
+        from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+        td = STR_DTYPE_TO_TORCH_DTYPE.get(value)
+        if isinstance(td, torch.dtype) and td != torch.uint8:
+            return str(td)
+    except Exception:
+        pass
+    return value
+
+
+@functools.lru_cache(maxsize=None)
+def _init_param_names(cls) -> tuple:
+    """Names of ``cls.__init__``'s parameters (the engine's constructor
+    contract for backend implementations), cached per class because the
+    state hash is computed on every traced module call."""
+    import inspect
+    try:
+        return tuple(p for p in inspect.signature(cls.__init__).parameters
+                     if p not in ("self", "args", "kwargs"))
+    except (TypeError, ValueError):
+        return ()
+
+
+@functools.lru_cache(maxsize=None)
+def _mamba_dtype_fields() -> tuple:
+    """Fields of vLLM's CacheConfig typed as MambaDType (empty if vLLM is absent)."""
+    try:
+        import typing
+        from vllm.config.cache import CacheConfig, MambaDType
+        return tuple(f for f, h in typing.get_type_hints(CacheConfig).items() if h is MambaDType)
+    except Exception:
+        return ()
+
+
+def _engine_config_state(module, attrs, excluded, is_primitive, canonicalize):
+    """Engine-defined configuration of ``module`` in hashable form.
+
+    See ``_extract_module_state_hash`` for the policy. Everything here is
+    driven by vLLM's own definitions (dtype literals, Enum types, the
+    backend implementation's constructor parameters, ``CacheConfig`` field
+    types); no attribute names are listed by hand. Returns ``()`` when vLLM
+    is not importable or the module carries none of this.
+    """
+    import enum
+
+    literals = _engine_cache_dtype_literals()
+
+    def canonical_value(v):
+        """Hashable form of an engine config value, or None to skip it.
+        Cache-dtype literals are resolved against the owning layer
+        (``module``), which is where vLLM stores the resolved
+        ``kv_cache_torch_dtype``; the backend impl only keeps the string."""
+        if is_primitive(v):
+            return canonicalize(v)
+        if isinstance(v, enum.Enum):
+            return ("enum", type(v).__name__, canonicalize(v.value))
+        if isinstance(v, str):
+            return _canonical_cache_dtype(v, module) if v in literals else None
+        if isinstance(v, torch.Tensor):
+            # Learned/derived per-layer tensors (sinks, alibi slopes): the
+            # kernel path depends on their presence and shape, not values.
+            return ("tensor", tuple(int(x) for x in v.shape))
+        return None
+
+    out = []
+    # 1. The module's own Enum / dtype-literal string attributes.
+    for k, v in sorted(attrs.items()):
+        if k.startswith("_") or k in excluded or is_primitive(v):
+            continue
+        if isinstance(v, enum.Enum) or (isinstance(v, str) and v in literals):
+            out.append((k, canonical_value(v)))
+
+    # 2. The backend implementation's constructor contract (vLLM
+    #    AttentionImpl and subclasses store their __init__ args on self).
+    impl = attrs.get("impl")
+    if impl is not None and not isinstance(impl, (str, bytes)):
+        for name in _init_param_names(type(impl)):
+            if not hasattr(impl, name):
+                continue
+            cv = canonical_value(getattr(impl, name))
+            if cv is not None:
+                out.append(("impl." + name, cv))
+
+    # 3. Cache dtypes read from an attached vLLM CacheConfig (Mamba mixers
+    #    read ``mamba_cache_dtype`` / ``mamba_ssm_cache_dtype`` from it).
+    cache_config = attrs.get("cache_config")
+    if cache_config is not None:
+        try:
+            from vllm.config.cache import CacheConfig
+            from vllm.utils.torch_utils import get_kv_cache_torch_dtype
+            if isinstance(cache_config, CacheConfig):
+                model_config = attrs.get("model_config")
+                model_dtype = getattr(model_config, "dtype", None)
+                for field in _mamba_dtype_fields():
+                    v = getattr(cache_config, field, None)
+                    if v is None:
+                        continue
+                    try:
+                        # The same resolver MambaStateDtypeCalculator uses.
+                        resolved = str(get_kv_cache_torch_dtype(v, model_dtype)) if model_dtype is not None else v
+                    except Exception:
+                        resolved = v
+                    out.append(("cache_config." + field, resolved))
+        except Exception:
+            pass
+
+    return tuple(out)
 
 
 def _module_call_wrapper(self, *args, **kwargs):

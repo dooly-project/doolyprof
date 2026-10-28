@@ -39,6 +39,7 @@ parser.add_argument("--attention-backend", type=str, default="FLASH_ATTN", help=
 parser.add_argument("--flash-attn-version", type=int, default=2, choices=[2, 3, 4], help="Pin flash-attention version when --attention-backend=FLASH_ATTN. Without this, vLLM auto-picks FA3 on Hopper / FA4 on Blackwell.")
 parser.add_argument("--quantization", type=str, default=None, choices=["fp8", "awq", "gptq"], help="Optional quantization scheme. 'fp8' requires Hopper+ (H100). With load_format=dummy, vLLM initializes random quantized weights — no quantized checkpoint needed.")
 parser.add_argument("--tokenizer", type=str, default=None, help="Override tokenizer (useful for models with broken tokenizer configs)")
+parser.add_argument("--kv-cache-dtype", type=str, default="auto", help="vLLM KV-cache dtype literal (auto, fp8, fp8_e4m3, fp8_e5m2, ...); recorded in each attention module's state hash")
 args = parser.parse_args()
 
 import torch
@@ -233,6 +234,7 @@ if __name__ == "__main__":
             trust_remote_code=True,
             max_num_batched_tokens=521,
             max_num_seqs=263,
+            kv_cache_dtype=args.kv_cache_dtype,
         )
         if args.attention_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}

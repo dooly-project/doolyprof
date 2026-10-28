@@ -32,7 +32,8 @@ python -m doolyprof.run.run-e2e \
     --db-path ./dooly_data.db
 ```
 
-This produces `./dooly_data.db`, a SQLite database keyed by `(model, attention_backend, tp_size, dtype)` containing per-operation latency samples.
+This produces `./dooly_data.db`, a SQLite database keyed by `(model, attention_backend, tp_size, dtype, kv_cache_dtype)` containing per-operation latency samples.
+Pass `--kv-cache-dtype fp8` (any vLLM KV-cache dtype literal) to profile a deployment with a quantized KV cache: only the attention operations get new signatures, every other operation is shared with the bf16-cache profile of the same model.
 
 ### Two-stage workflow
 

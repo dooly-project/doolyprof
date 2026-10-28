@@ -71,7 +71,8 @@ class VLLMLayerProfiler:
         attn_backend: str = "FLASHINFER",
         flash_attn_version: int = 2,
         quantization: Optional[str] = None,
-        gpu: str = "0"
+        gpu: str = "0",
+        kv_cache_dtype: str = "auto",
     ):
         """
         Initialize the profiler by creating a vLLM LLM instance.
@@ -85,9 +86,13 @@ class VLLMLayerProfiler:
             quantization: Optional quantization scheme (e.g. "fp8", "awq", "gptq").
                 When set with load_format="dummy", vLLM initializes random
                 quantized weights — no need to download a quantized checkpoint.
+            kv_cache_dtype: vLLM KV-cache dtype literal ("auto", "fp8", ...).
+                Must match the tracer's setting so module state hashes agree
+                between trace time and resolve/profile time.
         """
         self.model_name = model_name
         self.dtype = dtype
+        self.kv_cache_dtype = kv_cache_dtype
         self.torch_dtype = getattr(torch, dtype)
 
         # Set GPU visibility so vLLM initializes on the correct device.
@@ -112,6 +117,7 @@ class VLLMLayerProfiler:
             attention_backend=attn_backend,
             tensor_parallel_size=1,  # Single process, fake TP patches handle sharding
             trust_remote_code=True,
+            kv_cache_dtype=kv_cache_dtype,
         )
         if attn_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": flash_attn_version}
