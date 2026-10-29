@@ -40,7 +40,12 @@ class ModuleInfo:
     # runtime-branching config (e.g. sliding_window=None vs 4096) hash to
     # distinct signatures even when their kernel symbols match.
     state_hash: str = ""
-    
+    # Dotted paths (in the served model) of the module instances this info
+    # stands for, from the tracer's PATH: field. After dedup, one per member of
+    # the group. The resolver fetches the instance by path and verifies that
+    # all members are configured and shaped identically. Never hashed.
+    instance_paths: List[str] = field(default_factory=list)
+
     # Convenience properties for accessing hierarchy info
     @property
     def anchor(self) -> Optional[Event]:

@@ -249,6 +249,8 @@ if __name__ == "__main__":
         # Check weight shapes to verify sharding
         print(f"\n=== Checking weight shapes (should be divided by TP={FAKE_TP}) ===")
         model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        from doolyprof.tracer.hooks import register_module_paths
+        print(f"[Tracer] Recorded paths of {register_module_paths(model)} modules for PATH: annotations")
         for name, param in model.named_parameters():
             if "layers.0" in name and ("q_proj" in name or "down_proj" in name):
                 print(f"{name}: {param.shape}")

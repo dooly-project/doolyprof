@@ -537,6 +537,23 @@ def _engine_config_state(module, attrs, excluded, is_primitive, canonicalize):
     return tuple(out)
 
 
+# id(module) -> dotted path in the served model (e.g.
+# "model.layers.3.self_attn.q_norm"), filled once by register_module_paths
+# after the model is built. Written into each MODULE annotation as PATH:<path>
+# so the resolver can fetch the exact instance that ran with get_submodule,
+# instead of inferring it from class name, state hash and ancestors. The
+# resolver builds the same model (same vLLM, config, fake TP), so paths agree.
+_MODULE_PATHS: dict = {}
+
+
+def register_module_paths(model) -> int:
+    """Record the dotted path of every submodule of ``model``."""
+    _MODULE_PATHS.clear()
+    for path, m in model.named_modules():
+        _MODULE_PATHS.setdefault(id(m), path)
+    return len(_MODULE_PATHS)
+
+
 def _module_call_wrapper(self, *args, **kwargs):
     """
     Wrapper for nn.Module.__call__ that logs taint information.
@@ -617,6 +634,10 @@ def _module_call_wrapper(self, *args, **kwargs):
         _state_hash = _extract_module_state_hash(self)
         if _state_hash:
             annotated_name += f" STATE:{_state_hash}"
+        # PATH:<dotted path> is always the last field (see register_module_paths).
+        _path = _MODULE_PATHS.get(id(self))
+        if _path is not None:
+            annotated_name += f" PATH:{_path}"
     except Exception:
         annotated_name = f"MODULE: {module_name} (Log Error)"
 

@@ -166,6 +166,65 @@ def test_choose_trace_batch_size_derived_values():
         raise AssertionError("expected ValueError")
 
 
+def test_module_annotation_path_and_state_parsed():
+    from doolyprof.profiler.parser import HierarchicalTraceParser
+    name = ("MODULE: GemmaRMSNorm IN:[[NUM_TOKS(504), MODEL_CONFIG(16), MODEL_CONFIG(256)]] "
+            "DTYPES:[torch.bfloat16] STATE:4fc82af4562a PATH:language_model.model.layers.3.self_attn.q_norm")
+    pr = HierarchicalTraceParser(events=[{"ph": "X", "cat": "user_annotation", "name": name, "ts": 0, "dur": 5,
+                                          "pid": 1, "tid": 1, "args": {}}])
+    pr._parse_events(pr.raw_events)
+    ev = pr.modules[0]
+    assert ev.name == "GemmaRMSNorm", ev.name
+    assert ev.args["state_hash"] == "4fc82af4562a"
+    assert ev.args["module_path"] == "language_model.model.layers.3.self_attn.q_norm"
+    assert "PATH" not in (ev.params or "") and "STATE" not in (ev.params or "")
+
+
+def _resolver_on(model):
+    from doolyprof.profiler.resolver import ModuleResolver
+    r = ModuleResolver.__new__(ModuleResolver)
+    r.vlp = type("V", (), {"model": model})()
+    return r
+
+
+def test_recorded_path_group_check():
+    import torch
+    from doolyprof.profiler.module import ModuleInfo
+    from doolyprof.tracer.hooks import _extract_module_state_hash
+
+    class Norm(torch.nn.Module):
+        def __init__(self, n, eps=1e-6):
+            super().__init__(); self.weight = torch.nn.Parameter(torch.ones(n)); self.eps = eps
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.q_norm = Norm(256); self.k_norm = Norm(256)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.input_layernorm = Norm(2560); self.self_attn = Attn()
+
+    model = torch.nn.Module(); model.layers = torch.nn.ModuleList([Layer(), Layer()])
+    r = _resolver_on(model)
+    st = _extract_module_state_hash(model.layers[0].self_attn.q_norm)
+    ok = ModuleInfo(module_name="Norm", operation_name="Norm", inputs=[], is_module=True, state_hash=st,
+                    instance_paths=["layers.1.self_attn.q_norm", "layers.0.self_attn.q_norm", "layers.0.self_attn.k_norm"])
+    assert r._pick_recorded_path("Norm", ok) == "layers.1.self_attn.q_norm"
+    # a group that wrongly mixes 256- and 2560-wide norms is detected (same state hash, different weight)
+    mixed = ModuleInfo(module_name="Norm", operation_name="Norm", inputs=[], is_module=True, state_hash=st,
+                       instance_paths=["layers.0.input_layernorm", "layers.0.self_attn.q_norm"])
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r._pick_recorded_path("Norm", mixed)
+    assert "mixes 2 different instance kinds" in buf.getvalue(), buf.getvalue()
+    # a path that does not exist is reported, the remaining member is used
+    missing = ModuleInfo(module_name="Norm", operation_name="Norm", inputs=[], is_module=True, state_hash=st,
+                         instance_paths=["layers.9.self_attn.q_norm", "layers.0.self_attn.q_norm"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert r._pick_recorded_path("Norm", missing) == "layers.0.self_attn.q_norm"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

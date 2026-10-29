@@ -318,6 +318,7 @@ class TraceParser:
                 # stripped STATE: off the MODULE annotation name; COMPILE
                 # events never carry one.
                 state_hash = (anchor_args or {}).get("state_hash", "") or ""
+            module_path = (anchor_args or {}).get("module_path", "") if is_module else ""
             info = ModuleInfo(
                 module_name=module_name,
                 operation_name=op_name,
@@ -328,6 +329,7 @@ class TraceParser:
                 is_collective_op=is_collective,
                 hierarchy=hierarchy,
                 state_hash=state_hash,
+                instance_paths=[module_path] if module_path else [],
             )
 
             # Add module_info to anchor event
@@ -547,6 +549,9 @@ class TraceParser:
                 # group share the same module-instance state by construction
                 # since state_hash participates in the grouping key.
                 state_hash=template.state_hash,
+                # every member's instance path; the resolver checks they are
+                # interchangeable before using one
+                instance_paths=list(dict.fromkeys(p for i in infos for p in i.instance_paths)),
             )
 
             # Add module_info to anchor event

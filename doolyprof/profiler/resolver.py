@@ -256,6 +256,21 @@ class ModuleResolver:
 
         callable_path = paths[0]  # default: first path
 
+        # Preferred: the tracer recorded the exact instances (PATH:). Use them
+        # directly; the filters below only serve traces without paths.
+        if module.instance_paths:
+            picked = self._pick_recorded_path(lookup_name, module)
+            if picked is not None:
+                module._resolved_path = picked
+                try:
+                    submodule = self.vlp.model.get_submodule(picked)
+                    print(f"[RESOLVER]   Found module at: {picked} (recorded path)")
+                    print(f"[RESOLVER]   Module type: {type(submodule).__name__}")
+                    return submodule
+                except Exception as e:
+                    print(f"[RESOLVER]   get_submodule failed for recorded path '{picked}': {e}")
+                    return None
+
         # Path disambiguation when one class has many instances (e.g. 26
         # Attention layers, half sliding-window). The module's state hash is
         # computed by the same function in tracer and resolver
@@ -323,6 +338,51 @@ class ModuleResolver:
         except Exception as e:
             print(f"[RESOLVER]   get_submodule failed for '{callable_path}': {e}")
             return None
+
+    @staticmethod
+    def _instance_fingerprint(sub) -> tuple:
+        """What must agree for two instances to be interchangeable: the state
+        hash (configuration) and the name + shape of every parameter in the
+        subtree. No forward pass."""
+        from doolyprof.tracer.hooks import _extract_module_state_hash
+        return (_extract_module_state_hash(sub),
+                tuple((n, tuple(p.shape)) for n, p in sub.named_parameters()))
+
+    def _pick_recorded_path(self, lookup_name: str, module: ModuleInfo) -> Optional[str]:
+        """Return a recorded instance path after checking the dedup group.
+
+        Every member path must exist, carry the traced state hash, and have the
+        same fingerprint. A mismatch means the signature is missing something
+        that distinguishes the members; it is reported loudly (with the
+        differing parameter names) and the first member matching the traced
+        state hash is used.
+        """
+        target = (module.state_hash or "").strip()
+        fps = {}
+        for p in module.instance_paths:
+            try:
+                fps[p] = self._instance_fingerprint(self.vlp.model.get_submodule(p))
+            except Exception as e:
+                print(f"[RESOLVER]   ERROR: recorded path '{p}' for {lookup_name} not in the model: {e}", flush=True)
+        if not fps:
+            return None
+        bad_state = [p for p, fp in fps.items() if target and fp[0] != target]
+        if bad_state:
+            print(f"[RESOLVER]   ERROR: {len(bad_state)}/{len(fps)} recorded '{lookup_name}' instances do not "
+                  f"carry the traced state hash {target} (e.g. {bad_state[0]} -> {fps[bad_state[0]][0]})", flush=True)
+        groups = {}
+        for p, fp in fps.items():
+            groups.setdefault(fp, []).append(p)
+        if len(groups) > 1:
+            items = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+            base = dict(items[0][0][1])
+            print(f"[RESOLVER]   ERROR: dedup group '{lookup_name}' (state {target or '-'}) mixes "
+                  f"{len(groups)} different instance kinds; its signature is missing a field:", flush=True)
+            for fp, ps in items:
+                diff = sorted(set(fp[1]) ^ set(base.items()))[:4]
+                print(f"[RESOLVER]     {len(ps)} x e.g. {ps[0]} state={fp[0] or '-'} param diff vs largest={diff}", flush=True)
+        good = [p for p in module.instance_paths if p in fps and (not target or fps[p][0] == target)]
+        return (good or list(fps))[0]
 
     # ------------------------------------------------------------------
     # Dummy run
@@ -642,6 +702,7 @@ class ModuleResolver:
             # distinguish parents that differ only in runtime-branching
             # config (e.g. sliding_window on FA/Triton Attention).
             parent_state_hash = (parent_event.args or {}).get("state_hash", "") or ""
+            parent_path = (parent_event.args or {}).get("module_path", "") or ""
 
             return ModuleInfo(
                 module_name=parent_name,
@@ -653,6 +714,7 @@ class ModuleResolver:
                 hierarchy=hierarchy,
                 count=original.count,  # inherit count from original module
                 state_hash=parent_state_hash,
+                instance_paths=[parent_path] if parent_path else [],
             )
         else:
             # cpu_op parent: use the same import path, just different op name

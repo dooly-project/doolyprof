@@ -404,6 +404,11 @@ class HierarchicalTraceParser:
                 # off first so it doesn't leak into downstream IN/DTYPES/KWARGS
                 # slices, and stash it on the event's args for the signature
                 # builder to consume.
+                # PATH:<dotted module path> is the last field when present: the
+                # exact instance that ran (hooks.register_module_paths).
+                if ' PATH:' in name:
+                    name, _, _path_part = name.rpartition(' PATH:')
+                    args['module_path'] = _path_part.strip()
                 if ' STATE:' in name:
                     name, _, _state_part = name.rpartition(' STATE:')
                     args['state_hash'] = _state_part.strip()
