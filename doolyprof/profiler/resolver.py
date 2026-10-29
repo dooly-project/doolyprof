@@ -95,9 +95,6 @@ class ModuleResolver:
         self.max_seq_len = max_seq_len
         # Build module name → path dict once
         self._name_to_module = make_dict(vlp.model) if vlp else {}
-        # Cache path selection keyed by (class_name, target_kernel_tuple) so
-        # dummy-with-capture runs at most once per distinct kernel variant.
-        self._path_cache: Dict[Tuple[str, Tuple[str, ...]], str] = {}
         # Trace-time TAINT_REGISTRY (value -> taint name), passed in by the
         # profiler driver after TraceParser extracted it from the trace file.
         # Used to look up semantic dimension values (e.g. NUM_REQS) that are
@@ -259,35 +256,19 @@ class ModuleResolver:
 
         callable_path = paths[0]  # default: first path
 
-        # Path disambiguation when one class (e.g. "Attention") has many
-        # instances. Two strategies, in order of preference:
-        #   1. Kernel-match: if the ModuleInfo knows which GPU kernels its
-        #      anchor launched, pick the first path whose dummy forward pass
-        #      actually launches that kernel set. Needed for Gemma-style
-        #      alternating attention where layer[0] and layer[1] expose the
-        #      same class but different FlashInfer kernel variants.
-        #   2. Ancestor-class filter: fallback used when kernel info is empty
-        #      or matching fails (covers GemmaRMSNorm-style cases).
+        # Path disambiguation when one class has many instances (e.g. 26
+        # Attention layers, half sliding-window). The module's state hash is
+        # computed by the same function in tracer and resolver
+        # (_extract_module_state_hash) and covers the engine configuration
+        # that makes instances behave differently, so candidates are narrowed
+        # to instances with the traced hash; those are interchangeable. Classes
+        # without configuration (empty hash, e.g. GemmaRMSNorm as q_norm vs
+        # input_layernorm) fall back to the ancestor-class filter below.
         #
-        # Target kernels come from the containing module's full descendant
-        # kernel set (annotated by the parser). This is critical when two
-        # sibling CPU ops launch distinct kernels inside the same module —
-        # e.g. unified_kv_cache_update and unified_attention_with_output
-        # both sit under Attention. Taking only the anchor's own kernels
-        # would leave kv_cache_update indistinguishable across SWA variants,
-        # because its reshape_and_cache_flash kernel is identical per layer.
-        nearest_module = module.hierarchy.nearest_module if module.hierarchy else None
-        if nearest_module is not None and getattr(nearest_module, 'descendant_kernels', None):
-            target_kernels = tuple(sorted(nearest_module.descendant_kernels))
-        else:
-            target_kernels = tuple(sorted({k.name for k in module.kernels if k.name}))
-
-        # State-hash pre-filter. For backends where the kernel symbol doesn't
-        # encode every runtime-branching dim (FA2/Triton SWA: same kernel, but
-        # window_size changes behavior), narrow the candidate paths to the
-        # layer instances whose primitive attrs hash to the target value.
-        # Without this, kernel-match would succeed on layer 0 for every sig
-        # and both SWA/full variants would profile the same non-SWA layer.
+        # This replaced "kernel-match" (a profiled dummy forward per candidate,
+        # matched against the traced kernel names). Audited 2026-10-29 on 7
+        # models / 4 backends: kernel-match never changed the choice, and it
+        # cost ~38 s per process on Kimi-Linear (first Triton autotune).
         target_state_hash = (module.state_hash or "").strip()
         if len(paths) > 1 and target_state_hash:
             from doolyprof.tracer.hooks import _extract_module_state_hash
@@ -306,24 +287,11 @@ class ModuleResolver:
                           f"(target={target_state_hash})")
                 paths = filtered_paths
                 callable_path = paths[0]
-
-        if len(paths) > 1 and target_kernels:
-            cache_key = (lookup_name, target_kernels, target_state_hash)
-            cached = self._path_cache.get(cache_key)
-            if cached is not None and cached in paths:
-                callable_path = cached
-                print(f"[RESOLVER]   Kernel-match cache hit → {callable_path}")
             else:
-                matched = self._pick_path_by_kernels(paths, module, set(target_kernels))
-                if matched is not None:
-                    callable_path = matched
-                    self._path_cache[cache_key] = matched
-                    print(f"[RESOLVER]   Kernel-match picked {callable_path}")
-
-        # Remember the picked path on the ModuleInfo so the outer dummy run
-        # (post-import) uses it to key forward_context / build_layer_metadata
-        # instead of defaulting to paths[0] via get_layer_name_by_module.
-        module._resolved_path = callable_path
+                # Tracer and resolver disagree on this class's configuration:
+                # falling back to paths[0] may pick the wrong variant.
+                print(f"[RESOLVER]   WARNING: no '{lookup_name}' instance has the traced state "
+                      f"hash {target_state_hash}; falling back to {paths[0]}", flush=True)
 
         if callable_path == paths[0] and len(paths) > 1 and module.hierarchy is not None:
             ancestor = module.hierarchy.anchor.parent  # parent of the GemmaRMSNorm event
@@ -342,6 +310,11 @@ class ModuleResolver:
                         break
                 ancestor = ancestor.parent
 
+        # Remember the final path on the ModuleInfo so the dummy run and the
+        # profiling phase key forward_context / layer metadata to the same
+        # instance (instead of defaulting to paths[0]).
+        module._resolved_path = callable_path
+
         try:
             submodule = self.vlp.model.get_submodule(callable_path)
             print(f"[RESOLVER]   Found module at: {callable_path}")
@@ -350,63 +323,6 @@ class ModuleResolver:
         except Exception as e:
             print(f"[RESOLVER]   get_submodule failed for '{callable_path}': {e}")
             return None
-
-    def _pick_path_by_kernels(
-        self, paths: List[str], module: ModuleInfo, target_kernels: set
-    ) -> Optional[str]:
-        """Return the first path whose dummy forward launches target_kernels.
-
-        For each candidate path we get the submodule, run the standard resolver
-        dummy pass under a CUDA profiler, and accept if the captured kernel
-        name set is a superset of target_kernels (extra kernels from allocator
-        / reshape activity are fine).
-        """
-        for path in paths:
-            try:
-                submodule = self.vlp.model.get_submodule(path)
-            except Exception:
-                continue
-            captured = self._capture_kernels(submodule, module, layer_name=path)
-            if captured is None:
-                continue
-            
-            # print(captured)
-            # print(target_kernels)
-            # return None
-            if target_kernels.issubset(captured):
-                return path
-            # Log mismatch to help debugging without being too noisy.
-            missing = sorted(target_kernels - captured)
-            if missing:
-                print(f"[RESOLVER]   path={path} missing {missing[0][:80]}...")
-        return None
-
-    def _capture_kernels(
-        self,
-        callable_obj: Callable,
-        module: ModuleInfo,
-        layer_name: Optional[str] = None,
-    ) -> Optional[set]:
-        """Run one dummy forward and return the set of GPU kernel names launched."""
-        from torch.profiler import profile, ProfilerActivity
-        from torch.autograd import DeviceType
-
-        try:
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                ok = self._try_dummy_run(callable_obj, module, layer_name_override=layer_name)
-                if not ok:
-                    return None
-                torch.cuda.synchronize()
-        except Exception as e:
-            print(f"[RESOLVER]   Kernel capture failed: {e}")
-            return None
-
-        captured: set = set()
-        for evt in prof.events():
-            dev = getattr(evt, 'device_type', None)
-            if dev == DeviceType.CUDA and evt.name:
-                captured.add(evt.name)
-        return captured
 
     # ------------------------------------------------------------------
     # Dummy run

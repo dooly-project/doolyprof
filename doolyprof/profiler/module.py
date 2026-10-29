@@ -228,32 +228,6 @@ class ModuleComparator:
             return tuple((name, params) for name, depth, params in sorted_sigs)
         return ()
 
-    def _get_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
-        """Distinct GPU-kernel symbols launched under this anchor.
-
-        Sorted, deduped so the same set produces the same tuple regardless of
-        order. Two ops that share CPU-level shape params but dispatch different
-        kernels (e.g. Gemma local vs global attention under FlashInfer) get
-        different signatures from this alone.
-        """
-        return tuple(sorted({k.name for k in module.kernels if k.name}))
-
-    def _get_module_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
-        """Kernels reachable from the anchor's nearest containing module.
-
-        Mirrors the `module_kernel_tuple` dimension used by trace.py's
-        _deduplicate_module_infos so the DB signature stays aligned with the
-        trace-time grouping. Without this, two trace-dedup groups whose
-        anchor-level fields happen to collide (e.g. Gemma's
-        unified_kv_cache_update under SWA=true vs SWA=false Attention, where
-        the direct kernel is identical `reshape_and_cache_flash`) hash to the
-        same sig_hash and one variant's count silently overwrites the other.
-        """
-        nearest = module.hierarchy.nearest_module if module.hierarchy else None
-        if nearest is None:
-            return ()
-        return tuple(sorted(getattr(nearest, 'descendant_kernels', frozenset())))
-
     def _module_signature(
         self, module: ModuleInfo
     ) -> Tuple:
@@ -266,7 +240,7 @@ class ModuleComparator:
         #           + dtype (derived from the op's own traced inputs).
         #
         # Deliberately NOT hashed: the ops executed under the anchor
-        # (descendants) and the raw kernel symbols. Both describe how the
+        # (descendants) and GPU kernel names. Both describe how the
         # engine happened to execute this instance, not what it computes:
         # the descendant list differed between instances of one layer class
         # only through one-time work (Triton autotuning, per-forward cached

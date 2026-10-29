@@ -809,30 +809,6 @@ class HierarchicalTraceParser:
         """
         return [m for m in self.modules if m.children]
 
-    def _annotate_module_descendant_kernels(self) -> None:
-        """For each module event, record the set of GPU kernel names launched
-        anywhere inside its forward, stored on the event as
-        ``event.descendant_kernels`` (frozenset[str]).
-
-        Implementation: walk each kernel's ``.parent`` chain once and add its
-        name to every module ancestor encountered. Total work is
-        O(num_kernels × average_depth); negligible next to tree build.
-        """
-        per_module: Dict[int, set] = defaultdict(set)
-        module_refs: Dict[int, Event] = {}
-        for kernel in self.kernels:
-            name = kernel.name
-            if not name:
-                continue
-            cur = kernel.parent
-            while cur is not None:
-                if cur.cat == 'module':
-                    per_module[id(cur)].add(name)
-                    module_refs[id(cur)] = cur
-                cur = cur.parent
-        for mid, names in per_module.items():
-            module_refs[mid].descendant_kernels = frozenset(names)
-
     def extract_module_to_operation_mapping(self) -> List[OperationHierarchy]:
         """
         Extract module→operation mappings as OperationHierarchy dataclasses.
@@ -849,13 +825,6 @@ class HierarchicalTraceParser:
         - kernel → anchor → nearest_module → root_module
         - anchor.parent chain for full path
         """
-        # Annotate every module event with the set of GPU kernel names
-        # reachable from inside its subtree. Used by trace.py's dedup key so
-        # CPU ops at different sibling-kernel contexts (e.g. Gemma 2 layers
-        # with alternating SWA attention kernels) split correctly instead of
-        # collapsing into a single group by their own direct kernel alone.
-        self._annotate_module_descendant_kernels()
-
         # 1. Collect kernel → anchor mappings
         anchor_to_kernels: Dict[int, List[Event]] = defaultdict(list)  # id(anchor) → kernels
         anchor_events: Dict[int, Event] = {}  # id(anchor) → anchor Event

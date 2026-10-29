@@ -479,33 +479,15 @@ class TraceParser:
             model_params_list = info._semantic_params_list()
             model_params_tuple = tuple(sorted(model_params_list[0].items())) if model_params_list else ()
 
-            # Kernel-level discriminator: two anchors with identical CPU-op
-            # shapes but different GPU kernels (e.g. Gemma local vs global
-            # attention under FlashInfer) must stay as separate groups so the
-            # profiler measures each variant independently.
-            kernel_tuple = tuple(sorted({k.name for k in info.kernels if k.name}))
-
-            # Containing-module discriminator: tells apart CPU ops whose own
-            # kernel is identical but whose sibling ops under the same parent
-            # module dispatch different kernels (e.g. Gemma's
-            # unified_kv_cache_update — same reshape_and_cache kernel at every
-            # layer, but the sibling attention_with_output dispatches local
-            # vs global FlashInfer templates). Without this, all 42 layers'
-            # kv_cache_update collapse into one group and the SWA partition
-            # is lost during resolver absorb.
             nearest_module = info.hierarchy.nearest_module if info.hierarchy else None
-            module_kernel_tuple: Tuple[str, ...] = ()
-            if nearest_module is not None:
-                module_kernel_tuple = tuple(sorted(
-                    getattr(nearest_module, 'descendant_kernels', frozenset())
-                ))
 
-            # Module-state discriminator. Tells apart instances whose kernel
-            # symbols are identical but whose runtime-branching config
-            # differs (e.g. FA2/Triton Attention layers with sliding_window=None
-            # vs sliding_window=4096 — same kernel binary, different runtime
-            # arg). _extract_module_state_hash in the tracer produces the
-            # hex digest.
+            # Module-state discriminator: instances of one class that differ in
+            # configuration (sliding window vs full attention, KV-cache dtype,
+            # attention backend ...) land in separate groups. GPU kernel names
+            # are deliberately NOT part of the key: they vary with the traced
+            # token count, and the state hash already separates every variant
+            # they used to (audited 2026-10-29). Must match the signature hash
+            # fields in ModuleComparator._module_signature.
             #
             # For MODULE anchors (is_module=True), use the module's own hash.
             # For raw-op anchors (e.g. vllm::unified_kv_cache_update), inherit
@@ -522,8 +504,6 @@ class TraceParser:
                 base_name,
                 info.operation_name,
                 model_params_tuple,
-                kernel_tuple,
-                module_kernel_tuple,
                 state_hash,
                 info.dtype,
             )
@@ -536,8 +516,6 @@ class TraceParser:
             base_name,
             _op_name,
             _model_params_tuple,
-            _kernel_tuple,
-            _module_kernel_tuple,
             _state_hash,
             _dtype,
         ), infos in groups.items():
@@ -548,8 +526,7 @@ class TraceParser:
             print(
                 f"[DEBUG] Deduplicating {count} modules with signature: {base_name}, "
                 f"operation: {template.operation_name}, model_params: {_model_params_tuple}, "
-                f"kernels: {_kernel_tuple}, "
-                f"module_kernels: {_module_kernel_tuple}"
+                f"state: {_state_hash or '-'}"
             )
 
             dedup_info = ModuleInfo(
