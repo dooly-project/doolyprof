@@ -359,6 +359,20 @@ class TraceParser:
 
         dedup_module_infos = self._deduplicate_module_infos(module_infos)
 
+        # A MIX dimension without components cannot follow the sweep: the
+        # generator would hold it at its traced size while the NUM_TOKS dims
+        # move, and the op would run on inconsistent shapes. Say so loudly.
+        for info in dedup_module_infos:
+            for i, inp in enumerate(info.inputs):
+                if inp.type != "Tensor":
+                    continue
+                for j in inp.get_mix_dims():
+                    comps = inp.dimension_components[j] if inp.dimension_components else None
+                    if not comps:
+                        print(f"[TraceParser] WARNING: {info.module_name}/{info.operation_name} "
+                              f"input{i} dim{j} is MIX({inp.actual_shape[j]}) with no components; "
+                              f"it will stay fixed during sweeps", flush=True)
+
         # for module in dedup_module_infos:
         #     if module.is_collective_op:
         #         print(f"Module: {module.module_name}, Operation: {module.operation_name}, Inputs: {len(module.inputs)}")

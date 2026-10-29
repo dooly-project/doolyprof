@@ -21,6 +21,7 @@ import torch  # noqa: E402
 from doolyprof.tracer.hooks import _extract_module_state_hash  # noqa: E402
 from doolyprof.profiler.trace import _derive_op_dtype  # noqa: E402
 from doolyprof.profiler.finput import ProfileInput  # noqa: E402
+from doolyprof.profiler.taint import DimensionType  # noqa: E402
 
 try:
     from vllm.v1.attention.backend import AttentionType
@@ -125,6 +126,58 @@ def test_mamba_cache_config_dtype():
 
 def _inp(dtype, shape=(65, 4096), typ="Tensor"):
     return ProfileInput(type=typ, dtype=dtype, dimensions=[], actual_shape=list(shape))
+
+
+def test_layer_index_attrs_excluded():
+    # vLLM stores the layer position on KDA / linear-attention / MoE layers as
+    # layer_idx (or layer_id, block_idx); it names the instance, not its config.
+    a, b = attention_like(), attention_like()
+    a.layer_idx, b.layer_idx = 0, 19
+    assert _extract_module_state_hash(a) == _extract_module_state_hash(b)
+    a.layer_id, b.layer_id = 3, 4
+    a.block_idx, b.block_idx = 1, 2
+    assert _extract_module_state_hash(a) == _extract_module_state_hash(b)
+    b.sliding_window = 4096  # a real configuration difference must still split
+    assert _extract_module_state_hash(a) != _extract_module_state_hash(b)
+
+
+def test_signature_hash_ignores_descendants():
+    """Two anchors that agree on op name, own dims, state hash and dtype hash equal even if the
+    ops executed under them differ (one-time autotuning, cached metadata, tracer records)."""
+    from doolyprof.profiler.module import ModuleComparator, ModuleInfo
+    from doolyprof.profiler.parser import Event, OperationHierarchy
+
+    def ev(name, cat="cpu_op", **args):
+        return Event(cat=cat, name=name, ts=0, dur=1, ev_idx=None, external_id=None, python_id=None,
+                     python_parent_id=None, args=args)
+
+    def info(children, state="2dcd83b04195", dtype="bfloat16", hidden=2304):
+        anchor = ev("KimiDeltaAttention", cat="module")
+        for i, c in enumerate(children):
+            anchor.children[i] = ev(c)
+        h = OperationHierarchy(anchor=anchor, root_module=anchor, nearest_module=anchor, kernels=[], taints=[])
+        inp = ProfileInput(type="Tensor", dtype="c10::BFloat16", dimensions=[DimensionType.NUM_TOKENS, DimensionType.MODEL_CONFIG],
+                           actual_shape=[504, hidden])
+        return ModuleInfo(module_name="KimiDeltaAttention", operation_name="KimiDeltaAttention", inputs=[inp],
+                          is_module=True, dtype=dtype, hierarchy=h, state_hash=state)
+
+    cmp = ModuleComparator()
+    steady = info(["aten::linear"] * 18 + ["vllm::kda_attention"])
+    first = info(["aten::linear"] * 18 + ["vllm::kda_attention", "aten::cumsum", "aten::cat", "PythonSubclass"])
+    assert cmp._hash_signature(cmp._module_signature(steady)) == cmp._hash_signature(cmp._module_signature(first))
+    assert len(cmp._descendant_signature(first)) == 22 and len(cmp._descendant_signature(steady)) == 19  # still recorded
+    for other in (info(["aten::linear"], state="ffffffffffff"), info(["aten::linear"], dtype="float16"),
+                  info(["aten::linear"], hidden=4096)):
+        assert cmp._hash_signature(cmp._module_signature(steady)) != cmp._hash_signature(cmp._module_signature(other))
+
+
+def test_impl_class_in_state_hash():
+    """Backends sharing one constructor contract must still hash apart."""
+    a, b = attention_like(), attention_like()
+    class OtherImpl(FakeImpl):
+        pass
+    b.impl = OtherImpl(32, 128, 0.088, 8, None, None, "auto", None, b.attn_type, None, None)
+    assert _extract_module_state_hash(a) != _extract_module_state_hash(b)
 
 
 def test_derive_op_dtype():

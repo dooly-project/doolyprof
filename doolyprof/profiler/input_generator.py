@@ -1,6 +1,22 @@
 from doolyprof.profiler.module import ModuleInfo
+from doolyprof.profiler.taint import DimensionType
 from typing import List, Dict, Any, Tuple, Optional, Union
 import torch
+
+
+def _component_axis(taint_name: str) -> Optional[str]:
+    """Which sweep axis a MIX component scales with, by exact label.
+
+    The tracer's NUM_TOKS / NUM_REQS labels (the DimensionType values) follow
+    the workload; every other label is a fixed factor: MODEL_CONFIG, the
+    MAX_NUM_TOKS / MAX_NUM_REQS buffer bounds (a substring test would have
+    swept those), "?" and anything unknown.
+    """
+    if taint_name == DimensionType.NUM_TOKENS.value:
+        return "num_tokens"
+    if taint_name == DimensionType.NUM_REQUESTS.value:
+        return "num_requests"
+    return None
 
 from doolyprof.profiler.utils.generate_batch import (generate_vidur_inputs, generate_vidur_num_tokens, AttentionBatchConfig, get_attention_batch_sizes_to_profile)
 
@@ -217,12 +233,13 @@ class InputGenerator:
                         if components:
                             new_size = 1
                             for taint_name, qty in components.items():
-                                if 'NUM_TOK' in taint_name:
+                                axis = _component_axis(taint_name)
+                                if axis == "num_tokens":
                                     new_size *= num_tokens
-                                elif 'NUM_REQ' in taint_name:
+                                elif axis == "num_requests":
                                     new_size *= num_requests
                                 else:
-                                    # MODEL_CONFIG or other - use original quantity
+                                    # MODEL_CONFIG / MAX_* bound / unknown: fixed factor
                                     new_size *= qty
                             shape.append(new_size)
                         else:
@@ -403,16 +420,18 @@ class InputGenerator:
             inp.get_reqs_dim() for inp in self.module.inputs if inp.type == "Tensor"
         )
 
-        # MIX dimensions containing NUM_TOKENS or NUM_REQUESTS (incl. MAX_* variants)
+        # MIX dimensions with a NUM_TOKS / NUM_REQS component are swept along
+        # that axis too (MAX_* bounds are fixed factors, see _component_axis)
         for inp in self.module.inputs:
             if inp.type == "Tensor" and inp.dimension_components:
                 for dim_idx in inp.get_mix_dims():
                     components = inp.dimension_components[dim_idx]
                     if components:
                         for taint_name in components.keys():
-                            if 'NUM_TOK' in taint_name:
+                            axis = _component_axis(taint_name)
+                            if axis == "num_tokens":
                                 has_num_tokens_dim = True
-                            if 'NUM_REQ' in taint_name:
+                            if axis == "num_requests":
                                 has_num_requests_dim = True
 
         workload_configs = []

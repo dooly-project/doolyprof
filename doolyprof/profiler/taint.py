@@ -36,6 +36,36 @@ class TaintInput:
     dimensions: List[TaintDimension]
 
 
+_DIM_RE = re.compile(r'([A-Za-z_?]+)\((\d+)\)(?:\[hist:([^\]]*)\])?')
+_LABEL_TO_TYPE = {t.value: t for t in DimensionType}
+
+
+def _make_dimension(label: str, value: int, hist: str) -> TaintDimension:
+    """Map one traced label to a TaintDimension.
+
+    ``MAX_<label>`` folds onto its base type (MAX_NUM_TOKS -> NUM_TOKENS).
+    A label that is not a sweepable workload axis ("?", "SINGLETON", any
+    label this profiler does not know) is MODEL_CONFIG: fixed, never swept.
+    MIX history pairs are "taint:qty" as the tracer writes them
+    (tensor._format_dim: ``f"{taint}:{qty}"``); the legacy "qty:taint" order
+    is accepted too. A pair with no integer side is skipped.
+    """
+    base = label[4:] if label.startswith("MAX_") else label
+    dim_type = _LABEL_TO_TYPE.get(base, DimensionType.MODEL_CONFIG)
+    components = None
+    if dim_type == DimensionType.MIX:
+        components = {}
+        for component in (hist or "").split(","):
+            parts = [x.strip() for x in component.split(":")]
+            if len(parts) != 2:
+                continue
+            if parts[1].isdigit():          # taint:qty (tracer)
+                components[parts[0]] = int(parts[1])
+            elif parts[0].isdigit():        # qty:taint (legacy)
+                components[parts[1]] = int(parts[0])
+    return TaintDimension(dim_type, value, components)
+
+
 def parse_taint_string(taint_name: str) -> List[TaintInput]:
     # Use greedy match (.*) to capture all inputs until the final ]]
     # e.g., [[?(7), MODEL_CONFIG(4096)] | [?(7), MODEL_CONFIG(1024)] | [?(7), MODEL_CONFIG(1024)]]
@@ -63,87 +93,24 @@ def parse_taint_string(taint_name: str) -> List[TaintInput]:
             # print(f"[DEBUG @ taint.py] taint_inputs: {taint_inputs}")
             continue
 
-        # Remove outer brackets if present
-        input_str = input_str.strip('[]')
+        # Do not strip brackets: the outer [[...]] match already consumed the
+        # list's own brackets, and a trailing "]" here belongs to a MIX
+        # history ("MIX(n)[hist:...]" as the last dim) that the regex below
+        # needs intact. _DIM_RE ignores stray brackets anyway.
 
         # print(f"[DEBUG @ taint.py] input_str: {input_str}")
 
         dimensions = []
 
-        # Find all dimension patterns:
-        # - MODEL_CONFIG(value)
-        # - ?(value)
-
-        # Patterns for different taint types
-        # MIX(value)[hist:qty:taint,qty:taint,...] - with component history
-        mix_pattern = r'MIX\((\d+)\)\[hist:([^\]]+)\]'
-        # MODEL_CONFIG(value)
-        model_config_pattern = r'MODEL_CONFIG\((\d+)\)'
-        # NUM_TOKS(value) or MAX_NUM_TOKS(value)
-        num_toks_pattern = r'(?:MAX_)?NUM_TOKS\((\d+)\)'
-        # NUM_REQS(value) or MAX_NUM_REQS(value)
-        num_reqs_pattern = r'(?:MAX_)?NUM_REQS\((\d+)\)'
-        # ?(value) - unknown/untracked dimensions
-        unknown_pattern = r'\?\((\d+)\)'
-
-        # Find all dimension patterns (including MIX with history)
-        # Note: Order matters - check MIX first since it has [hist:...] suffix
-        dim_pattern = r'MIX\(\d+\)\[hist:[^\]]+\]|MODEL_CONFIG\(\d+\)|(?:MAX_)?NUM_TOKS\(\d+\)|(?:MAX_)?NUM_REQS\(\d+\)|\?\(\d+\)'
-        dim_matches = re.findall(dim_pattern, input_str)
-
-        # print(f"[DEBUG @ taint.py] dim_matches: {dim_matches}")
-
-        for dim_match in dim_matches:
-            # Check if it's MIX with history
-            mix_match = re.match(mix_pattern, dim_match)
-            if mix_match:
-                value = int(mix_match.group(1))
-                history_str = mix_match.group(2)
-                # Parse history: "qty:taint,qty:taint,..." -> {taint: qty}
-                components = {}
-                for component in history_str.split(','):
-                    parts = component.strip().split(':')
-                    if len(parts) == 2:
-                        qty_str, taint_name = parts
-                        try:
-                            qty = int(qty_str)
-                            components[taint_name] = qty
-                        except ValueError:
-                            pass
-                dimensions.append(TaintDimension(DimensionType.MIX, value, components))
-                continue
-            # Check if it's MODEL_CONFIG
-            mc_match = re.match(model_config_pattern, dim_match)
-            if mc_match:
-                value = int(mc_match.group(1))
-                dimensions.append(TaintDimension(DimensionType.MODEL_CONFIG, value))
-                # print(f"[DEBUG @ taint.py] dimensions (mc_match): {dimensions}")
-                continue
-
-            # Check if it's NUM_TOKS
-            num_toks_match = re.match(num_toks_pattern, dim_match)
-            if num_toks_match:
-                value = int(num_toks_match.group(1))
-                dimensions.append(TaintDimension(DimensionType.NUM_TOKENS, value))
-                # print(f"[DEBUG @ taint.py] dimensions (num_toks_match): {dimensions}")
-                continue
-
-            # Check if it's NUM_REQS
-            num_reqs_match = re.match(num_reqs_pattern, dim_match)
-            if num_reqs_match:
-                value = int(num_reqs_match.group(1))
-                dimensions.append(TaintDimension(DimensionType.NUM_REQUESTS, value))
-                # print(f"[DEBUG @ taint.py] dimensions (num_reqs_match): {dimensions}")
-                continue
-
-            # Check if it's ?(value) - treat as MODEL_CONFIG (conservative, won't sweep)
-            unknown_match = re.match(unknown_pattern, dim_match)
-            if unknown_match:
-                value = int(unknown_match.group(1))
-                dimensions.append(TaintDimension(DimensionType.MODEL_CONFIG, value))
-                # print(f"[DEBUG @ taint.py] dimensions (unknown_match): {dimensions}")
-                continue
-
+        # Every dimension label the tracer emits has the shape LABEL(N),
+        # optionally followed by [hist:...] (DimTaint.display in
+        # doolyprof.tracer.types, "?(N)" for untracked dims and "SINGLETON(1)"
+        # for broadcast dims in tensor._format_dim). Match that shape rather
+        # than a fixed list of labels, so no dimension is dropped and the
+        # result stays aligned with the traced shape; the label is mapped to a
+        # DimensionType afterwards.
+        for label, value, hist in _DIM_RE.findall(input_str):
+            dimensions.append(_make_dimension(label, int(value), hist))
 
         taint_inputs.append(TaintInput(dimensions=dimensions))
 

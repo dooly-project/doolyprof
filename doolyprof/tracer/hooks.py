@@ -348,7 +348,17 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
     #                  was called in one process but not the other
     #   quant_config, query_quant : late-bound infrastructure objects that
     #                  may be None in one context and non-None in another
-    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant"})
+    #   layer_idx, layer_id, block_idx : the module's position in the layer
+    #                  stack. vLLM derives it from the module prefix
+    #                  (models.utils.extract_layer_index) and stores it on
+    #                  attention / linear-attention / MoE layers in 34 of its
+    #                  model files (KimiDeltaAttention, ShortConv,
+    #                  Llama4Attention, OAIAttention, Zamba2 ...). It names the
+    #                  instance, not its configuration: hashing it gives every
+    #                  layer of a class its own signature and multiplies the
+    #                  resolve / profile work by the layer count.
+    _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant",
+                                   "layer_idx", "layer_id", "block_idx"})
 
     try:
         d = vars(module)
@@ -483,6 +493,10 @@ def _engine_config_state(module, attrs, excluded, is_primitive, canonicalize):
     #    AttentionImpl and subclasses store their __init__ args on self).
     impl = attrs.get("impl")
     if impl is not None and not isinstance(impl, (str, bytes)):
+        # The implementation class IS the backend (FlashAttentionImpl,
+        # FlashInferImpl, TritonAttentionImpl, ...). Several backends share
+        # one constructor contract, so the class name must be explicit.
+        out.append(("impl.class", type(impl).__qualname__))
         for name in _init_param_names(type(impl)):
             if not hasattr(impl, name):
                 continue

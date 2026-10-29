@@ -31,7 +31,7 @@ parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B",
 parser.add_argument("--tp", "--tensor_parallel_size", type=int, default=1, dest="tensor_parallel_size", help="Fake tensor parallel size (weights sharded but run on 1 GPU)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="Model dtype")
 parser.add_argument("--prompts", type=str, default="Hello, how are you? I am fine, and ", help="Prompt to run")
-parser.add_argument("--batch-size", type=int, default=5, help="Number of identical prompts to send in a single generate() call")
+parser.add_argument("--batch-size", type=int, default=5, help="Requested number of identical prompts in the traced generate() call; raised to the nearest value whose NUM_REQS / cu_seqlens / NUM_TOKS avoid the taint registry (see choose_trace_batch_size)")
 parser.add_argument("--max-tokens", type=int, default=1, help="Max tokens to generate")
 parser.add_argument("--trace_dir", type=str, default="./vllm_traces_tp", help="Directory to save trace")
 parser.add_argument("--gpu", type=int, default=0, help="GPU device index to use")
@@ -57,7 +57,7 @@ os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
 # and installs hooks on tensor factory functions for taint propagation
 from doolyprof.tracer.hooks import install_hooks
 from doolyprof.tracer.config import patch_autoconfig, patch_input_buffers
-from doolyprof.tracer.registry import TAINT_REGISTRY
+from doolyprof.tracer.registry import TAINT_REGISTRY, choose_trace_batch_size
 from doolyprof.tracer import disable_taint_tracking, enable_taint_tracking
 
 # Disable taint tracking initially - we'll enable it only during the actual generate() call
@@ -235,6 +235,10 @@ if __name__ == "__main__":
             max_num_batched_tokens=521,
             max_num_seqs=263,
             kv_cache_dtype=args.kv_cache_dtype,
+            # The warm-up generate below runs the very prompts that are then
+            # traced; with prefix caching their prefill would be served from
+            # cache and vanish from the trace.
+            enable_prefix_caching=False,
         )
         if args.attention_backend == "FLASH_ATTN":
             llm_kwargs["attention_config"] = {"flash_attn_version": args.flash_attn_version}
@@ -250,6 +254,27 @@ if __name__ == "__main__":
                 print(f"{name}: {param.shape}")
 
         sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+
+        # Pick the trace batch against the registry the engine config filled
+        # during init, so the scheduler's NUM_REQS / NUM_TOKS and the derived
+        # cu_seqlens length cannot collide with a MODEL_CONFIG value.
+        prompt_len = len(llm.get_tokenizer().encode(args.prompts))
+        sched = llm.llm_engine.vllm_config.scheduler_config
+        batch_size = choose_trace_batch_size(
+            args.batch_size, prompt_len, sched.max_num_seqs, sched.max_num_batched_tokens)
+        if batch_size != args.batch_size:
+            print(f"[Tracer] Requested batch {args.batch_size} collides with the taint registry "
+                  f"or exceeds one scheduler step; using {batch_size}")
+        print(f"[Tracer] Trace batch: {batch_size} prompts x {prompt_len} tokens = "
+              f"{batch_size * prompt_len} tokens (registry: {len(TAINT_REGISTRY)} entries)")
+        prompts = [args.prompts] * batch_size
+
+        # Warm-up: run the exact traced prompts once with taint tracking still
+        # off, so one-time work keyed on these shapes (Triton autotuning of
+        # the linear-attention kernels, lazy allocations) happens outside the
+        # profiled generate instead of inside the first layer's trace.
+        llm.generate(prompts, sampling_params=sampling_params)
+        print("[Tracer] Warm-up generate done")
 
         # Enable taint tracking now - warm-up/compilation is done
         enable_taint_tracking()
@@ -282,6 +307,15 @@ if __name__ == "__main__":
                 # Inject the taint registry as a top-level key.
                 with open(trace_path, "r") as f:
                     data = _json.load(f)
+                # Keep only the event categories the trace parser consumes
+                # (cpu ops, GPU kernels, and the tracer's own annotations).
+                # Kineto's async-correlation ("ac2g"), CUDA runtime/driver,
+                # overhead and memcpy records are the bulk of the file and are
+                # never read by HierarchicalTraceParser.
+                _KEEP = {"cpu_op", "kernel", "user_annotation"}
+                _n_all = len(data.get("traceEvents", []))
+                data["traceEvents"] = [e for e in data.get("traceEvents", []) if e.get("cat") in _KEEP]
+                print(f"[Tracer] Kept {len(data['traceEvents'])}/{_n_all} trace events ({sorted(_KEEP)})")
                 data["dooly_taint_registry"] = {
                     str(v): str(t) for v, t in TAINT_REGISTRY.items()
                     if not isinstance(t, dict)
@@ -302,7 +336,7 @@ if __name__ == "__main__":
             record_shapes=True,
             on_trace_ready=dooly_trace_handler(args.trace_dir, args.model, args.tensor_parallel_size),
         ) as prof:
-            llm.generate([args.prompts] * args.batch_size, sampling_params=sampling_params)
+            llm.generate(prompts, sampling_params=sampling_params)
 
         print(f"[Tracer] Done tracing {args.model}, output saved to {args.trace_dir}")
 

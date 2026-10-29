@@ -213,22 +213,20 @@ class ModuleComparator:
         return signatures
 
     def _get_model_param_signature(self, module: ModuleInfo) -> Tuple[Tuple[str, Any], ...]:
-        # Get anchor's own params first
+        """The anchor's own MODEL_CONFIG dims and scalar args, sorted."""
         params_list = module._semantic_params_list()
         anchor_params = params_list[0] if params_list else {}
-        anchor_params_tuple = tuple(sorted(anchor_params.items()))
+        return tuple(sorted(anchor_params.items()))
 
-        # Collect descendant signatures if children exist
+    def _descendant_signature(self, module: ModuleInfo) -> Tuple[Tuple[str, Any], ...]:
+        """Semantic ops executed under the anchor, as (name, tainted dims),
+        sorted. Recorded in signature_json for inspection; NOT part of the
+        hash (see _module_signature)."""
         if module.hierarchy and module.hierarchy.anchor.children:
             descendant_sigs = self._collect_descendant_signatures(module.hierarchy.anchor)
-            # Sort by (name, depth) for consistent ordering
             sorted_sigs = sorted(descendant_sigs, key=lambda x: (x[0], x[1]))
-            # Combine anchor params with descendant signatures
-            descendant_tuple = tuple((name, params) for name, depth, params in sorted_sigs)
-            return (anchor_params_tuple, descendant_tuple)
-        else:
-            # No children: return just anchor's params
-            return anchor_params_tuple
+            return tuple((name, params) for name, depth, params in sorted_sigs)
+        return ()
 
     def _get_kernel_signature(self, module: ModuleInfo) -> Tuple[str, ...]:
         """Distinct GPU-kernel symbols launched under this anchor.
@@ -260,21 +258,24 @@ class ModuleComparator:
         self, module: ModuleInfo
     ) -> Tuple:
         # Signature = operation_name
-        #           + semantic descendant structure (torch-op / module-class
-        #             names with tainted dims; raw device-kernel symbols are
-        #             filtered out in _collect_descendant_signatures)
+        #           + the anchor's own MODEL_CONFIG dims / scalar args
         #           + state_hash (own for modules, else nearest parent
-        #             module's — carries runtime-branching config such as
-        #             sliding_window that shapes alone don't capture)
-        #           + dtype (the only discriminator none of the above encode).
+        #             module's — the module's configuration, including the
+        #             attention backend's implementation class and its
+        #             constructor contract, cache dtypes, sliding window ...)
+        #           + dtype (derived from the op's own traced inputs).
         #
-        # The raw autotuner kernel symbols that used to form two extra tuple
-        # parts (_get_kernel_signature / _get_module_kernel_signature) are
-        # DROPPED: their tile/prefix/format specialization changes with the
-        # traced token count and was falsely splitting identical ops. Backend
-        # / algorithm identity is preserved by the semantic op NAMES that
-        # remain in the descendant structure (e.g. _vllm_fa2_C::varlen_fwd for
-        # FLASH_ATTN vs its absence).
+        # Deliberately NOT hashed: the ops executed under the anchor
+        # (descendants) and the raw kernel symbols. Both describe how the
+        # engine happened to execute this instance, not what it computes:
+        # the descendant list differed between instances of one layer class
+        # only through one-time work (Triton autotuning, per-forward cached
+        # metadata, tracer dispatch records), and the kernel symbols change
+        # with the traced token count. Over every database produced so far
+        # the descendant list never separated two anchors that agreed on the
+        # four hashed fields, except the attention backend, which the state
+        # hash now carries explicitly. The descendants are still written to
+        # signature_json (5th element) for inspection.
         if module.is_module:
             state_hash = module.state_hash or ""
         else:
@@ -348,7 +349,8 @@ class ModuleComparator:
             for module, callable in mod_call_tuple:
                 signature = self._module_signature(module)
                 sig_hash = self._hash_signature(signature)
-                sig_json = json.dumps(signature, sort_keys=True, default=str)
+                sig_json = json.dumps(signature + (self._descendant_signature(module),),
+                                      sort_keys=True, default=str)
 
                 # print(f"Model Name: {model_name}, Module Name: {module.module_name}, Hash: {sig_hash[:16]}...")
 

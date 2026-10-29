@@ -130,8 +130,10 @@ class Event:
 
         result = []
         for tensor_str in tensor_strs:
-            # Extract integers from ?(N) or MODEL_CONFIG(N) patterns
-            dims = re.findall(r'(?:\?|NUM_TOKS|NUM_REQS|MODEL_CONFIG)\((\d+)\)', tensor_str)
+            # Every label the tracer emits has the shape LABEL(N) (DimTaint.display,
+            # plus ?(N) and SINGLETON(1)); match the shape, not a fixed label list,
+            # so no dimension is dropped and the result stays aligned with the trace.
+            dims = re.findall(r'[A-Za-z_?]+\((\d+)\)', tensor_str)
             result.append([int(d) for d in dims])
 
         return result
@@ -602,10 +604,20 @@ class HierarchicalTraceParser:
         # if (event.cat == 'comm'):
         #     print(f"event_base: {event_base}, event.name: {event.name}, event.params: {event.params}")
 
-        # Find the single best taint (shortest duration) that matches by name
+        # Find the single best taint (shortest duration) that matches by name.
+        # Candidates come from an index keyed by the taint's base name (and by
+        # its pre-overload prefix, so "index.Tensor" is found for "index"),
+        # each list sorted by start time; only taints that can overlap the
+        # event in time are visited instead of every taint in the trace.
+        entry = self._taint_index().get(event_base)
         best_taint = None
-
-        for taint in self.taints:
+        if entry is None:
+            return []
+        ts_list, candidates, max_dur = entry
+        import bisect
+        lo = bisect.bisect_left(ts_list, event.ts - max_dur)
+        hi = bisect.bisect_right(ts_list, event.end_ts)
+        for taint in candidates[lo:hi]:
             # Check temporal overlap
             if not (taint.ts <= event.end_ts and taint.end_ts >= event.ts):
                 continue
@@ -636,6 +648,41 @@ class HierarchicalTraceParser:
                 best_taint = taint
 
         return [best_taint] if best_taint else []
+
+    @staticmethod
+    def _taint_base_name(taint_name: str) -> str:
+        if taint_name.startswith("MODULE: "):
+            return taint_name.replace("MODULE: ", "")
+        if taint_name.startswith("API: "):
+            return taint_name.replace("API: ", "")
+        if taint_name.startswith("COMM: "):
+            return taint_name.replace("COMM: ", "")
+        return taint_name.split("::")[-1]
+
+    def _taint_index(self):
+        """base name -> (start times, taints sorted by start, max duration).
+        Built once per taint list and rebuilt if the list changes. A taint is
+        indexed under its full base name and, when it carries an overload
+        suffix ("index.Tensor"), also under the prefix ("index"), mirroring the
+        exact / prefix match rules applied in find_associated_taints."""
+        n = len(self.taints)
+        cached = getattr(self, "_taint_index_cache", None)
+        if cached is not None and cached[0] == n:
+            return cached[1]
+        buckets = {}
+        for t in self.taints:
+            base = self._taint_base_name(t.name)
+            keys = {base}
+            if "." in base:
+                keys.add(base.split(".", 1)[0])
+            for k in keys:
+                buckets.setdefault(k, []).append(t)
+        index = {}
+        for k, lst in buckets.items():
+            lst.sort(key=lambda t: t.ts)
+            index[k] = ([t.ts for t in lst], lst, max((t.dur for t in lst), default=0))
+        self._taint_index_cache = (n, index)
+        return index
 
     def find_nearest_tainted_ancestor(self, event: Event) -> Optional[Event]:
         """

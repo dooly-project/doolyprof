@@ -11,7 +11,8 @@ The registry enables efficient taint lookup when resolving -1 dimensions in resh
 from typing import Optional, Dict, Set
 from .types import Taint
 
-__all__ = ['TAINT_REGISTRY', 'register_taint', 'lookup_taint', 'clear_registry']
+__all__ = ['TAINT_REGISTRY', 'register_taint', 'lookup_taint', 'clear_registry',
+           'choose_trace_batch_size']
 
 # Global taint registry: value → taint info
 # - For pure taints: value → Taint object
@@ -165,3 +166,43 @@ def clear_registry():
     Useful for testing or when resetting the taint tracking system.
     """
     TAINT_REGISTRY.clear()
+
+
+def choose_trace_batch_size(requested: int, prompt_len: int, max_num_seqs: int,
+                            max_num_batched_tokens: int, registry=None) -> int:
+    """Pick how many identical prompts the traced ``generate()`` sends so that
+    none of the runtime integers it produces collides with a value already in
+    the taint registry.
+
+    By the time the engine is built, the registry holds every integer the
+    model config registered as MODEL_CONFIG (including list members such as
+    layer-index lists) plus MAX_NUM_REQS / MAX_NUM_TOKS. ``register_taint``
+    raises a TAINT CONFLICT when the scheduler then registers one of those
+    integers as NUM_REQS or NUM_TOKS, and any raw tensor dimension equal to a
+    registered value takes that value's label. One prefill step over ``b``
+    prompts of ``prompt_len`` tokens exposes three such integers: ``b``
+    (NUM_REQS, seq_lens), ``b + 1`` (query_start_loc / cu_seqlens) and
+    ``b * prompt_len`` (NUM_TOKS, positions, slot_mapping). The batch must
+    also fit a single scheduler step (``b <= max_num_seqs`` and
+    ``b * prompt_len <= max_num_batched_tokens``), otherwise the prefill is
+    chunked and NUM_TOKS no longer equals the prompt total.
+
+    Returns the smallest admissible ``b >= requested``, else the largest
+    admissible ``b < requested``; raises if no batch size is admissible.
+    """
+    reg = TAINT_REGISTRY if registry is None else registry
+    taken = set(reg)
+    upper = min(max_num_seqs, max_num_batched_tokens // max(prompt_len, 1))
+
+    def admissible(b: int) -> bool:
+        return 2 <= b <= upper and not ({b, b + 1, b * prompt_len} & taken)
+
+    for b in range(max(requested, 2), upper + 1):
+        if admissible(b):
+            return b
+    for b in range(min(requested, upper), 1, -1):
+        if admissible(b):
+            return b
+    raise ValueError(
+        f"No trace batch size in [2, {upper}] avoids the taint registry "
+        f"(prompt_len={prompt_len}, registry values={sorted(v for v in taken if isinstance(v, int))})")
