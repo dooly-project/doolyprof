@@ -12,7 +12,7 @@ from typing import Optional, Dict, Set
 from .types import Taint
 
 __all__ = ['TAINT_REGISTRY', 'register_taint', 'lookup_taint', 'clear_registry',
-           'choose_trace_batch_size']
+           'choose_trace_batch_size', 'choose_trace_batch']
 
 # Global taint registry: value → taint info
 # - For pure taints: value → Taint object
@@ -206,3 +206,26 @@ def choose_trace_batch_size(requested: int, prompt_len: int, max_num_seqs: int,
     raise ValueError(
         f"No trace batch size in [2, {upper}] avoids the taint registry "
         f"(prompt_len={prompt_len}, registry values={sorted(v for v in taken if isinstance(v, int))})")
+
+
+def choose_trace_batch(requested: int, prompt_len: int, max_num_seqs: int,
+                       max_num_batched_tokens: int, registry=None):
+    """Like ``choose_trace_batch_size`` but may shorten the prompt.
+
+    Models whose config registers every small integer (Kimi-Linear's layer
+    lists cover 2..27, Llama-4 Scout's cover 2..48) leave no admissible batch
+    once ``b * prompt_len`` must fit one scheduler step: with the default
+    47-token prompt and max_num_batched_tokens=521 the batch cannot exceed 11.
+    Prompt content is irrelevant to tracing, only the shapes matter, so the
+    prompt is truncated to the longest length that admits a batch.
+
+    Returns ``(batch_size, prompt_len_used)``; raises if no length >= 2 works.
+    """
+    last_err = None
+    for length in range(prompt_len, 1, -1):
+        try:
+            return choose_trace_batch_size(requested, length, max_num_seqs,
+                                           max_num_batched_tokens, registry), length
+        except ValueError as e:
+            last_err = e
+    raise ValueError(f"No (batch, prompt length) pair avoids the taint registry: {last_err}")

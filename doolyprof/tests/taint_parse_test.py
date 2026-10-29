@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from doolyprof.profiler.taint import DimensionType, parse_taint_string  # noqa: E402
 from doolyprof.profiler.finput import extract_inputs_from_taint  # noqa: E402
 from doolyprof.profiler.parser import Event  # noqa: E402
-from doolyprof.tracer.registry import choose_trace_batch_size  # noqa: E402
+from doolyprof.tracer.registry import choose_trace_batch_size, choose_trace_batch  # noqa: E402
 
 MC, NT, NR, MIX = (DimensionType.MODEL_CONFIG, DimensionType.NUM_TOKENS,
                    DimensionType.NUM_REQUESTS, DimensionType.MIX)
@@ -136,6 +136,22 @@ def test_choose_trace_batch_size_kimi_linear():
     assert choose_trace_batch_size(2, 18, 263, 521, reg) == 28
     assert choose_trace_batch_size(28, 18, 263, 521, reg) == 28
     assert choose_trace_batch_size(40, 18, 263, 521, reg) == 28  # 29*18 > 521: fall back downward
+
+
+def test_choose_trace_batch_truncates_prompt_when_needed():
+    reg = {v: "MODEL_CONFIG" for v in range(2, 28)}
+    reg.update({32: "MODEL_CONFIG", 263: "MAX_NUM_REQS", 521: "MAX_NUM_TOKS", 512: "MODEL_CONFIG"})
+    # default 47-token prompt: 521 // 47 = 11 and 2..27 are taken -> shorten to 18 tokens, batch 28
+    assert choose_trace_batch(7, 47, 263, 521, reg) == (28, 18)
+    assert choose_trace_batch(7, 18, 263, 521, reg) == (28, 18)   # nothing to truncate
+    assert choose_trace_batch(7, 19, 263, 521, {}) == (7, 19)     # empty registry: as requested
+    big = {v: "MODEL_CONFIG" for v in range(2, 300)}
+    try:
+        choose_trace_batch(7, 47, 263, 521, big)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_choose_trace_batch_size_derived_values():

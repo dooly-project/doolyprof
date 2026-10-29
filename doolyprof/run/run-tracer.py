@@ -57,7 +57,7 @@ os.environ["VLLM_FAKE_TP"] = str(FAKE_TP)
 # and installs hooks on tensor factory functions for taint propagation
 from doolyprof.tracer.hooks import install_hooks
 from doolyprof.tracer.config import patch_autoconfig, patch_input_buffers
-from doolyprof.tracer.registry import TAINT_REGISTRY, choose_trace_batch_size
+from doolyprof.tracer.registry import TAINT_REGISTRY, choose_trace_batch
 from doolyprof.tracer import disable_taint_tracking, enable_taint_tracking
 
 # Disable taint tracking initially - we'll enable it only during the actual generate() call
@@ -258,16 +258,20 @@ if __name__ == "__main__":
         # Pick the trace batch against the registry the engine config filled
         # during init, so the scheduler's NUM_REQS / NUM_TOKS and the derived
         # cu_seqlens length cannot collide with a MODEL_CONFIG value.
-        prompt_len = len(llm.get_tokenizer().encode(args.prompts))
+        prompt_ids = llm.get_tokenizer().encode(args.prompts)
         sched = llm.llm_engine.vllm_config.scheduler_config
-        batch_size = choose_trace_batch_size(
-            args.batch_size, prompt_len, sched.max_num_seqs, sched.max_num_batched_tokens)
+        batch_size, prompt_len = choose_trace_batch(
+            args.batch_size, len(prompt_ids), sched.max_num_seqs, sched.max_num_batched_tokens)
         if batch_size != args.batch_size:
             print(f"[Tracer] Requested batch {args.batch_size} collides with the taint registry "
                   f"or exceeds one scheduler step; using {batch_size}")
+        if prompt_len < len(prompt_ids):
+            print(f"[Tracer] Prompt truncated from {len(prompt_ids)} to {prompt_len} tokens so a "
+                  f"collision-free batch fits one scheduler step")
         print(f"[Tracer] Trace batch: {batch_size} prompts x {prompt_len} tokens = "
               f"{batch_size * prompt_len} tokens (registry: {len(TAINT_REGISTRY)} entries)")
-        prompts = [args.prompts] * batch_size
+        from vllm.inputs import TokensPrompt
+        prompts = [TokensPrompt(prompt_token_ids=list(prompt_ids[:prompt_len]))] * batch_size
 
         # Warm-up: run the exact traced prompts once with taint tracking still
         # off, so one-time work keyed on these shapes (Triton autotuning of
