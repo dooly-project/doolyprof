@@ -141,6 +141,13 @@ def test_layer_index_attrs_excluded():
     assert _extract_module_state_hash(a) != _extract_module_state_hash(b)
 
 
+def test_engine_capacity_attr_excluded():
+    """MLA's workspace size follows the engine's max_num_seqs / max_model_len, not the layer."""
+    a, b = attention_like(), attention_like()
+    a.chunked_prefill_workspace_size, b.chunked_prefill_workspace_size = 504960, 491520
+    assert _extract_module_state_hash(a) == _extract_module_state_hash(b)
+
+
 def test_signature_hash_ignores_descendants():
     """Two anchors that agree on op name, own dims, state hash and dtype hash equal even if the
     ops executed under them differ (one-time autotuning, cached metadata, tracer records)."""

@@ -311,10 +311,13 @@ class TraceParser:
             # ops don't carry it.
             state_hash = ""
             if is_module:
-                # hierarchy.operation_args is the anchor event's args dict;
-                # the parser put 'state_hash' there when it stripped STATE:
-                # off the MODULE annotation name.
-                state_hash = (hierarchy.operation_args or {}).get("state_hash", "") or ""
+                # anchor_args is the MODULE event's args (for compile anchors
+                # it was switched to the containing module above, together
+                # with the name, inputs and taint string: the profiler calls
+                # that module). The parser put 'state_hash' there when it
+                # stripped STATE: off the MODULE annotation name; COMPILE
+                # events never carry one.
+                state_hash = (anchor_args or {}).get("state_hash", "") or ""
             info = ModuleInfo(
                 module_name=module_name,
                 operation_name=op_name,

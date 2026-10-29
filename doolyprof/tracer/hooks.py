@@ -357,8 +357,15 @@ def _extract_module_state_hash(module: "torch.nn.Module") -> str:
     #                  instance, not its configuration: hashing it gives every
     #                  layer of a class its own signature and multiplies the
     #                  resolve / profile work by the layer count.
+    #   chunked_prefill_workspace_size : MLA scratch-buffer size, set by
+    #                  MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
+    #                  from the engine's capacity (max_num_seqs x block_size,
+    #                  max_model_len), not from the layer: the tracer and the
+    #                  resolver engines are sized differently, so it made the
+    #                  traced and resolve-time hashes disagree.
     _NON_CONFIG_ATTRS = frozenset({"training", "quant_config", "query_quant",
-                                   "layer_idx", "layer_id", "block_idx"})
+                                   "layer_idx", "layer_id", "block_idx",
+                                   "chunked_prefill_workspace_size"})
 
     try:
         d = vars(module)
